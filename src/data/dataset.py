@@ -165,6 +165,7 @@ class TurnTakingTrainDataset(Dataset):
         target_chunks: int,
         chunk_ms: int,
         sample_rate: int,
+        augment_audio: bool = True,
     ) -> None:
         self.samples = list(samples)
         self.train_audio_dir = train_audio_dir
@@ -174,6 +175,7 @@ class TurnTakingTrainDataset(Dataset):
         self.target_chunks = target_chunks
         self.chunk_ms = chunk_ms
         self.sample_rate = sample_rate
+        self.augment_audio = augment_audio
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -207,6 +209,21 @@ class TurnTakingTrainDataset(Dataset):
             wave = wave[:, :expected_frames]
         return wave
 
+    def _augment_audio(self, wave: torch.Tensor) -> torch.Tensor:
+        """SpecAugment-style time masking + Gaussian noise (training only)."""
+        if not self.augment_audio:
+            return wave
+        T = wave.shape[1]
+        # Random Gaussian noise
+        if torch.rand(1).item() < 0.3:
+            wave = wave + 0.005 * torch.randn_like(wave)
+        # Random time mask (zero out a segment)
+        if torch.rand(1).item() < 0.5:
+            mask_len = int(T * 0.05 * torch.rand(1).item())
+            mask_start = torch.randint(0, max(1, T - mask_len), (1,)).item()
+            wave[:, mask_start:mask_start + mask_len] = 0
+        return wave
+
     def __getitem__(self, idx: int) -> Dict:
         sample = self.samples[idx]
         labels = self._load_labels(sample.conv_id)
@@ -220,6 +237,7 @@ class TurnTakingTrainDataset(Dataset):
         text_json = self._load_text_json(sample.conv_id)
         text = build_text_context(text_json.get("utterances", []), start_ms, end_ms)
         wave = self._load_wave_segment(sample.conv_id, start_ms, end_ms)
+        wave = self._augment_audio(wave)
 
         out = {
             "conv_id": sample.conv_id,
@@ -282,12 +300,22 @@ class TurnTakingTestDataset(Dataset):
         }
 
 
-def build_collate_fn(tokenizer, text_max_length: int):
-    def _collate(batch: List[Dict]) -> Dict[str, torch.Tensor]:
+class CollateFn:
+    """Module-level callable class for DataLoader collate_fn (picklable on Windows)."""
+
+    def __init__(self, tokenizer, text_max_length: int):
+        self.tokenizer = tokenizer
+        self.text_max_length = text_max_length
+        if hasattr(self.tokenizer, "truncation_side"):
+            self.tokenizer.truncation_side = "left"
+        if hasattr(self.tokenizer, "padding_side"):
+            self.tokenizer.padding_side = "left"
+
+    def __call__(self, batch: List[Dict]) -> Dict[str, torch.Tensor]:
         texts = [b["text"] for b in batch]
-        tokenized = tokenizer(
+        tokenized = self.tokenizer(
             texts,
-            max_length=text_max_length,
+            max_length=self.text_max_length,
             truncation=True,
             padding=True,
             return_tensors="pt",
@@ -316,4 +344,6 @@ def build_collate_fn(tokenizer, text_max_length: int):
             out["segment_id"] = [b["segment_id"] for b in batch]
         return out
 
-    return _collate
+
+def build_collate_fn(tokenizer, text_max_length: int) -> CollateFn:
+    return CollateFn(tokenizer, text_max_length)

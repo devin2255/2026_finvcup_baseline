@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 from pathlib import Path
 
 import torch
@@ -30,6 +31,7 @@ def parse_args():
     p.add_argument("--checkpoint", type=str, required=True)
     p.add_argument("--test_root", type=str, required=True, help="测试数据根目录")
     p.add_argument("--threshold", type=float, default=0.5)
+    p.add_argument("--threshold_file", type=str, default=None, help="per-label thresholds JSON (overrides --threshold)")
     p.add_argument("--batch_size", type=int, default=None, help="默认取 config train.eval_batch_size")
     p.add_argument("--max_segments", type=int, default=None, help="仅处理前 N 条（冒烟测试）")
     p.add_argument(
@@ -39,6 +41,15 @@ def parse_args():
         help="输出 pred.csv 路径",
     )
     return p.parse_args()
+
+
+def _resolve_thresholds(threshold_file: str | None, checkpoint: dict) -> dict | None:
+    if threshold_file:
+        with open(threshold_file, "r", encoding="utf-8") as f:
+            thr_data = json.load(f)
+        return thr_data["thresholds"]
+    thresholds = checkpoint.get("thresholds") if isinstance(checkpoint, dict) else None
+    return thresholds if isinstance(thresholds, dict) else None
 
 
 def main():
@@ -73,6 +84,7 @@ def main():
 
     model = MultimodalTurnTakingModel(cfg).to(device)
     ckpt = torch.load(args.checkpoint, map_location="cpu")
+    per_label_thresholds = _resolve_thresholds(args.threshold_file, ckpt)
     model.load_state_dict(ckpt["model"], strict=False)
     model.eval()
     use_amp = bool(cfg["train"].get("use_amp", False))
@@ -93,7 +105,7 @@ def main():
             context_labels = batch["context_labels"].to(device, non_blocking=True)
             segment_ids = batch["segment_id"]
 
-            with torch.cuda.amp.autocast(enabled=use_amp):
+            with torch.amp.autocast("cuda", enabled=use_amp):
                 logits = model(
                     waveform=waveform,
                     input_ids=input_ids,
@@ -108,10 +120,13 @@ def main():
                 p = probs[i].tolist()
                 if len(p) != len(multi_targets):
                     raise RuntimeError(f"logits dim {len(p)} != len(multi_targets) {len(multi_targets)}")
-                pred = [int(float(x) >= args.threshold) for x in p]
+                preds_binary = []
+                for j, name in enumerate(label_cols):
+                    thr = float(per_label_thresholds[name]) if per_label_thresholds else args.threshold
+                    preds_binary.append(int(float(p[j]) >= thr))
                 row = {"segment_id": seg_id}
                 for j, col in enumerate(label_cols):
-                    row[col] = pred[j]
+                    row[col] = preds_binary[j]
                 rows.append(row)
                 done += 1
                 if limit is not None and done >= limit:

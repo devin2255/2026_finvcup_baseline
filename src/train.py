@@ -1,5 +1,6 @@
 import argparse
 import math
+import random
 import sys
 from pathlib import Path
 
@@ -64,7 +65,7 @@ def evaluate(
         context_labels = batch["context_labels"].to(device, non_blocking=True)
         labels = batch["label"].to(device, non_blocking=True)
 
-        with torch.cuda.amp.autocast(enabled=use_amp):
+        with torch.amp.autocast("cuda", enabled=use_amp):
             logits = model(
                 waveform=waveform,
                 input_ids=input_ids,
@@ -90,9 +91,33 @@ def _format_multilabel_metrics_line(metrics: dict, label_names: list[str]) -> st
         parts.append(
             f"{n}:acc={metrics.get(f'{n}_accuracy', 0.0):.4f},"
             f"f1={metrics.get(f'{n}_f1', 0.0):.4f},"
+            f"bf1={metrics.get(f'{n}_best_f1', 0.0):.4f},"
             f"auc={metrics.get(f'{n}_roc_auc', 0.5):.4f}"
         )
     return " | ".join(parts)
+
+
+def _get_valid_loader_shuffle(cfg: dict) -> bool:
+    return bool(cfg.get("train", {}).get("eval_valid_shuffle", False))
+
+
+def _get_best_checkpoint_name(cfg: dict) -> str:
+    return str(cfg.get("train", {}).get("best_checkpoint_name", "best.pt"))
+
+
+def _select_eval_samples(samples: list, cfg: dict, seed: int) -> list:
+    sample_count = cfg.get("train", {}).get("eval_valid_sample_count", None)
+    if sample_count is None:
+        return list(samples)
+    sample_count = int(sample_count)
+    if sample_count <= 0 or sample_count >= len(samples):
+        return list(samples)
+    indices = sorted(random.Random(seed + 1009).sample(range(len(samples)), sample_count))
+    return [samples[i] for i in indices]
+
+
+def _extract_best_thresholds(metrics: dict, label_names: list[str]) -> dict[str, float]:
+    return {name: float(metrics.get(f"{name}_best_threshold", 0.5)) for name in label_names}
 
 
 def main():
@@ -154,12 +179,17 @@ def main():
         target_labels=multi_targets,
         max_samples=cfg["max_valid_samples"],
     )
+    valid_eval_samples = _select_eval_samples(valid_samples, cfg, seed=int(cfg["seed"]))
 
     if is_main:
         save_json(Path(paths["logs_dir"]) / "split_ids.json", split_ids)
         save_json(
             Path(paths["logs_dir"]) / "sample_count.json",
-            {"train_samples": len(train_samples), "valid_samples": len(valid_samples)},
+            {
+                "train_samples": len(train_samples),
+                "valid_samples": len(valid_samples),
+                "valid_eval_samples": len(valid_eval_samples),
+            },
         )
         writer = SummaryWriter(log_dir=str(Path(paths["logs_dir"]) / "tb"))
 
@@ -179,9 +209,10 @@ def main():
         target_chunks=int(cfg["target_chunks"]),
         chunk_ms=int(cfg["chunk_ms"]),
         sample_rate=int(cfg["sample_rate"]),
+        augment_audio=True,
     )
     valid_dataset = TurnTakingTrainDataset(
-        samples=valid_samples,
+        samples=valid_eval_samples,
         train_audio_dir=train_audio_dir,
         train_text_dir=train_text_dir,
         train_labels_dir=labels_dir,
@@ -189,6 +220,7 @@ def main():
         target_chunks=int(cfg["target_chunks"]),
         chunk_ms=int(cfg["chunk_ms"]),
         sample_rate=int(cfg["sample_rate"]),
+        augment_audio=False,
     )
 
     train_sampler = (
@@ -208,7 +240,7 @@ def main():
     valid_loader = DataLoader(
         valid_dataset,
         batch_size=int(cfg["train"]["eval_batch_size"]),
-        shuffle=False,
+        shuffle=_get_valid_loader_shuffle(cfg),
         num_workers=int(cfg["num_workers"]),
         collate_fn=collate_fn,
         pin_memory=True,
@@ -232,15 +264,39 @@ def main():
             find_unused_parameters=False,
         )
 
-    if cfg["train"].get("pos_weight_mode", "per_label") == "per_label":
+    if cfg["train"].get("pos_weight_mode", "per_label") in ("per_label", "capped_per_label"):
         y_mat = np.asarray([s.label_vec for s in train_samples], dtype=np.float32)  # [N,5]
         pos = y_mat.sum(axis=0)
         neg = y_mat.shape[0] - pos
         pw = neg / np.maximum(1.0, pos)
+        if cfg["train"].get("pos_weight_mode") == "capped_per_label":
+            cap = float(cfg["train"].get("pos_weight_cap", 5.0))
+            pw = np.minimum(pw, cap)
         pos_weight = torch.tensor(pw, device=device, dtype=torch.float32)
     else:
         pos_weight = torch.ones(len(multi_targets), device=device, dtype=torch.float32)
-    criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+    focal_gamma = float(cfg["train"].get("focal_gamma", 0.0))
+    if focal_gamma > 0:
+        # Focal Loss: down-weight easy examples, forcing the model to focus on
+        # hard/rare labels like BC (3.65%) and I (14.15%).
+        class MultiLabelFocalLoss(torch.nn.Module):
+            def __init__(self, gamma, pos_weight):
+                super().__init__()
+                self.gamma = gamma
+                self.register_buffer("pos_weight", pos_weight)
+
+            def forward(self, logits, targets):
+                bce = torch.nn.functional.binary_cross_entropy_with_logits(
+                    logits, targets, reduction="none", pos_weight=self.pos_weight,
+                )
+                probs = torch.sigmoid(logits)
+                p_t = targets * probs + (1 - targets) * (1 - probs)
+                return ((1 - p_t) ** self.gamma * bce).mean()
+
+        criterion = MultiLabelFocalLoss(focal_gamma, pos_weight)
+    else:
+        criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
     max_steps_per_epoch_cfg = cfg["train"].get("max_steps_per_epoch", None)
     max_steps_per_epoch = (
@@ -269,11 +325,11 @@ def main():
         num_warmup_steps=warmup_steps,
         num_training_steps=total_update_steps,
     )
-    scaler = torch.cuda.amp.GradScaler(enabled=bool(cfg["train"]["use_amp"]))
+    scaler = torch.amp.GradScaler("cuda", enabled=bool(cfg["train"]["use_amp"]))
 
     start_epoch = 0
     best_metric = -math.inf
-    best_path = Path(paths["checkpoints_dir"]) / "best.pt"
+    best_path = Path(paths["checkpoints_dir"]) / _get_best_checkpoint_name(cfg)
     if args.resume:
         ckpt = torch.load(args.resume, map_location="cpu")
         target_model = model.module if hasattr(model, "module") else model
@@ -325,7 +381,7 @@ def main():
             context_labels = batch["context_labels"].to(device, non_blocking=True)
             labels = batch["label"].to(device, non_blocking=True)
 
-            with torch.cuda.amp.autocast(enabled=use_amp):
+            with torch.amp.autocast("cuda", enabled=use_amp):
                 logits = model(
                     waveform=waveform,
                     input_ids=input_ids,
@@ -435,12 +491,16 @@ def main():
             save_json(Path(paths["logs_dir"]) / f"valid_epoch_{epoch}.json", metrics_valid)
             # 兼容旧脚本读取路径
             save_json(Path(paths["logs_dir"]) / f"eval_epoch_{epoch}.json", metrics_valid)
+            valid_thresholds = _extract_best_thresholds(metrics_valid, metric_label_names)
+            save_json(Path(paths["logs_dir"]) / f"thresholds_epoch_{epoch}.json", {"thresholds": valid_thresholds})
             if use_multi_label:
                 valid_per_label = _format_multilabel_metrics_line(metrics_valid, metric_label_names)
                 print(
                     f"[Epoch {epoch}] train_loss={epoch_loss_sum / max(1, epoch_step_count):.6f} "
                     f"valid_macro_acc={metrics_valid['macro_accuracy']:.4f} "
-                    f"valid_macro_f1={metrics_valid['macro_f1']:.4f} valid_macro_auc={metrics_valid['macro_roc_auc']:.4f} "
+                    f"valid_macro_f1={metrics_valid['macro_f1']:.4f} "
+                    f"valid_macro_best_f1={metrics_valid['macro_best_f1']:.4f} "
+                    f"valid_macro_auc={metrics_valid['macro_roc_auc']:.4f} "
                     f"| valid[{valid_per_label}] "
                     f"best_{save_metric}={max(best_metric, metric_value):.4f}"
                 )
@@ -456,10 +516,13 @@ def main():
                 if use_multi_label:
                     writer.add_scalar("valid/macro_accuracy", metrics_valid["macro_accuracy"], epoch)
                     writer.add_scalar("valid/macro_f1", metrics_valid["macro_f1"], epoch)
+                    writer.add_scalar("valid/macro_best_f1", metrics_valid["macro_best_f1"], epoch)
                     writer.add_scalar("valid/macro_roc_auc", metrics_valid["macro_roc_auc"], epoch)
                     for n in metric_label_names:
                         writer.add_scalar(f"valid/{n}_accuracy", metrics_valid[f"{n}_accuracy"], epoch)
                         writer.add_scalar(f"valid/{n}_f1", metrics_valid[f"{n}_f1"], epoch)
+                        writer.add_scalar(f"valid/{n}_best_f1", metrics_valid[f"{n}_best_f1"], epoch)
+                        writer.add_scalar(f"valid/{n}_best_threshold", metrics_valid[f"{n}_best_threshold"], epoch)
                         writer.add_scalar(f"valid/{n}_roc_auc", metrics_valid[f"{n}_roc_auc"], epoch)
                 else:
                     writer.add_scalar("valid/accuracy", metrics_valid["accuracy"], epoch)
@@ -478,9 +541,11 @@ def main():
                         "scheduler": scheduler.state_dict(),
                         "scaler": scaler.state_dict(),
                         "config": cfg,
+                        "thresholds": valid_thresholds,
                     },
                     best_path,
                 )
+                save_json(Path(paths["logs_dir"]) / "best_thresholds.json", {"thresholds": valid_thresholds})
             else:
                 bad_epochs += 1
                 if bad_epochs >= early_stop_patience:

@@ -45,7 +45,7 @@ class AudioEncoder(nn.Module):
         bsz, chans, _ = wave.shape
         mel_list = []
         for c in range(chans):
-            with torch.cuda.amp.autocast(enabled=False):
+            with torch.amp.autocast("cuda", enabled=False):
                 m = self._mel_transform(wave[:, c, :].float())
                 m = torch.clamp(m, min=float(self._log_clamp_min.item()))
                 m = torch.log(m)
@@ -64,17 +64,62 @@ class AttentionPooling(nn.Module):
         self.query = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
         self.scale = hidden_dim ** -0.5
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         # x: [B, T, D]
         scores = (self.query * x).sum(dim=-1) * self.scale  # [B, T]
-        weights = torch.softmax(scores, dim=-1).unsqueeze(-1)  # [B, T, 1]
+        if mask is not None:
+            if mask.ndim == 3:
+                mask = mask.squeeze(-1)
+            mask = mask.to(dtype=torch.bool, device=x.device)
+            scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
+        weights = torch.softmax(scores, dim=-1)  # [B, T]
+        if mask is not None:
+            weights = weights * mask.to(dtype=weights.dtype)
+            weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        weights = weights.unsqueeze(-1)  # [B, T, 1]
         return (x * weights).sum(dim=1)  # [B, D]
+
+
+class LowRankTensorFusion(nn.Module):
+    """Low-rank tensor fusion for compact high-order modality interactions."""
+    def __init__(self, input_dims: List[int], output_dim: int, rank: int):
+        super().__init__()
+        self.input_dims = list(input_dims)
+        self.output_dim = output_dim
+        self.rank = rank
+        self.factors = nn.ParameterList([
+            nn.Parameter(torch.empty(rank, input_dim + 1, output_dim))
+            for input_dim in self.input_dims
+        ])
+        self.fusion_weights = nn.Parameter(torch.ones(rank, output_dim))
+        self.bias = nn.Parameter(torch.zeros(output_dim))
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        for factor in self.factors:
+            nn.init.xavier_normal_(factor)
+        nn.init.constant_(self.fusion_weights, 1.0 / max(1, self.rank))
+        nn.init.zeros_(self.bias)
+
+    def forward(self, modalities: List[torch.Tensor]) -> torch.Tensor:
+        if len(modalities) != len(self.factors):
+            raise ValueError(f"Expected {len(self.factors)} modalities, got {len(modalities)}")
+
+        fused = None
+        for x, factor in zip(modalities, self.factors):
+            ones = x.new_ones(x.shape[0], 1)
+            augmented = torch.cat([ones, x], dim=-1)
+            projected = torch.einsum("bd,rdo->bro", augmented, factor)
+            fused = projected if fused is None else fused * projected
+
+        return (fused * self.fusion_weights.unsqueeze(0)).sum(dim=1) + self.bias
 
 
 class WhisperAudioEncoder(nn.Module):
     def __init__(
         self, model_name: str, sample_rate: int, proj_dim: int,
         freeze: bool = True, tail_ratio: float = 0.2,
+        unfreeze_layers: int = 0,
     ):
         super().__init__()
         self.sample_rate = sample_rate
@@ -85,6 +130,13 @@ class WhisperAudioEncoder(nn.Module):
         if self.freeze:
             for p in self.encoder.parameters():
                 p.requires_grad = False
+        if unfreeze_layers > 0 and self.freeze:
+            # Unfreeze the last N encoder layers for task adaptation
+            total_layers = len(self.encoder.layers)
+            for layer_idx in range(max(0, total_layers - unfreeze_layers), total_layers):
+                for p in self.encoder.layers[layer_idx].parameters():
+                    p.requires_grad = True
+        self.encoder_has_trainable_layers = any(p.requires_grad for p in self.encoder.parameters())
         hidden_size = int(self.encoder.config.d_model)
         self.attn_pool = AttentionPooling(hidden_size)
         self.proj = nn.Sequential(
@@ -105,10 +157,10 @@ class WhisperAudioEncoder(nn.Module):
         return inputs["input_features"]
 
     def forward(self, wave: torch.Tensor) -> torch.Tensor:
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast("cuda", enabled=False):
             input_features = self._build_input_features(wave).to(wave.device)
 
-        if self.freeze:
+        if self.freeze and not self.encoder_has_trainable_layers:
             with torch.no_grad():
                 hidden = self.encoder(input_features=input_features).last_hidden_state
         else:
@@ -223,16 +275,105 @@ class TextEncoder(nn.Module):
         L = hidden.shape[1]
         tail_start = max(0, L - int(L * self.tail_ratio))
         tail_hidden = hidden[:, tail_start:, :]
-        tail_mask = attention_mask[:, tail_start:].unsqueeze(-1).to(hidden.dtype)
-        masked_hidden = tail_hidden * tail_mask
-        pooled = self.attn_pool(masked_hidden)
+        tail_mask = attention_mask[:, tail_start:].to(dtype=torch.bool, device=hidden.device)
+        pooled = self.attn_pool(tail_hidden, mask=tail_mask)
         return pooled
+
+
+class MultimodalFusion(nn.Module):
+    """Lightweight cross-modal fusion with low-rank multimodal interaction + adaptive gating.
+
+    Key ideas:
+    - Low-rank tensor fusion captures high-order interactions across all modalities
+      without the full tensor product cost.
+    - Adaptive gates let the model decide how much to trust each modality per sample.
+    """
+
+    def __init__(
+        self,
+        audio_dim: int,
+        text_dim: int,
+        context_dim: int,
+        hand_dim: int,
+        hidden_dim: int,
+        bilinear_rank: int = 48,
+        dropout: float = 0.2,
+    ):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+
+        # Low-rank interaction over audio, text, context, and hand-crafted signals.
+        self.low_rank_fusion = LowRankTensorFusion(
+            input_dims=[audio_dim, text_dim, context_dim, hand_dim],
+            output_dim=hidden_dim,
+            rank=bilinear_rank,
+        )
+        self.low_rank_proj = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+        )
+
+        # Per-modality projections to hidden_dim
+        self.audio_proj = nn.Sequential(
+            nn.Linear(audio_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU(),
+        )
+        self.text_proj = nn.Sequential(
+            nn.Linear(text_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU(),
+        )
+        self.context_proj = nn.Sequential(
+            nn.Linear(context_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU(),
+        )
+        self.hand_proj = nn.Sequential(
+            nn.Linear(hand_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU(),
+        )
+
+        # Adaptive modality gates
+        gate_in = audio_dim + text_dim + context_dim + hand_dim
+        self.gate_net = nn.Sequential(
+            nn.Linear(gate_in, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 4),
+            nn.Sigmoid(),
+        )
+
+        # Final fusion projection
+        self.out_proj = nn.Sequential(
+            nn.Linear(hidden_dim * 5, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.out_dim = hidden_dim
+
+    def forward(
+        self, audio: torch.Tensor, text: torch.Tensor,
+        context: torch.Tensor, hand: torch.Tensor,
+    ) -> torch.Tensor:
+        # 1. Low-rank tensor interaction: joint space across all modalities
+        interaction_feat = self.low_rank_proj(
+            self.low_rank_fusion([audio, text, context, hand])
+        )  # [B, H]
+
+        # 2. Per-modality projections
+        a = self.audio_proj(audio)
+        t = self.text_proj(text)
+        c = self.context_proj(context)
+        h = self.hand_proj(hand)
+
+        # 3. Adaptive gates: learn when to trust each modality
+        all_raw = torch.cat([audio, text, context, hand], dim=-1)
+        gates = self.gate_net(all_raw)  # [B, 4]
+        a_g, t_g, c_g, h_g = gates[:, 0:1], gates[:, 1:2], gates[:, 2:3], gates[:, 3:4]
+
+        # 4. Concatenate all features (interaction + 4 gated modalities)
+        fused = torch.cat([interaction_feat, a * a_g, t * t_g, c * c_g, h * h_g], dim=-1)
+        return self.out_proj(fused)
 
 
 class MultimodalTurnTakingModel(nn.Module):
     def __init__(self, cfg: Dict):
         super().__init__()
-        # Baseline 固化为 event-level 多标签（未来 2s 窗口内各标签是否出现）
         audio_type = str(cfg["audio_encoder"].get("type", "cnn")).lower()
         if audio_type == "whisper":
             self.audio_encoder = WhisperAudioEncoder(
@@ -241,6 +382,7 @@ class MultimodalTurnTakingModel(nn.Module):
                 proj_dim=int(cfg["audio_encoder"]["proj_dim"]),
                 freeze=bool(cfg["audio_encoder"].get("freeze", True)),
                 tail_ratio=float(cfg["audio_encoder"].get("tail_ratio", 0.2)),
+                unfreeze_layers=int(cfg["audio_encoder"].get("unfreeze_layers", 0)),
             )
         else:
             self.audio_encoder = AudioEncoder(
@@ -268,24 +410,21 @@ class MultimodalTurnTakingModel(nn.Module):
             context_chunks=int(cfg["context_chunks"]),
         )
 
-        fusion_in = (
-            self.audio_encoder.out_dim
-            + self.text_encoder.out_dim
-            + self.context_encoder.out_dim
-            + self.hand_features.out_dim
+        fusion_cfg = cfg.get("fusion", {})
+        self.fusion = MultimodalFusion(
+            audio_dim=self.audio_encoder.out_dim,
+            text_dim=self.text_encoder.out_dim,
+            context_dim=self.context_encoder.out_dim,
+            hand_dim=self.hand_features.out_dim,
+            hidden_dim=int(fusion_cfg.get("hidden_dim", 256)),
+            bilinear_rank=int(fusion_cfg.get("bilinear_rank", 48)),
+            dropout=float(fusion_cfg.get("dropout", 0.2)),
         )
-        h1, h2 = cfg["fusion_head"]["hidden_dims"]
-        dropout = cfg["fusion_head"]["dropout"]
+
         num_targets = len(cfg.get("labels", {}).get("multi_targets", []))
         self.num_targets = num_targets if num_targets > 0 else 1
         self.head = nn.Sequential(
-            nn.Linear(fusion_in, h1),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(h1, h2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(h2, self.num_targets),
+            nn.Linear(self.fusion.out_dim, self.num_targets),
         )
 
     def forward(
@@ -299,8 +438,8 @@ class MultimodalTurnTakingModel(nn.Module):
         text_feat = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
         context_feat = self.context_encoder(context_labels=context_labels)
         hand_feat = self.hand_features(context_labels)
-        fusion = torch.cat([audio_feat, text_feat, context_feat, hand_feat], dim=-1)
-        logits = self.head(fusion)
+        fused = self.fusion(audio_feat, text_feat, context_feat, hand_feat)
+        logits = self.head(fused)
         if self.num_targets == 1:
             return logits.squeeze(-1)
         return logits

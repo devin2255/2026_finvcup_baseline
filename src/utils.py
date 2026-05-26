@@ -76,6 +76,28 @@ def compute_binary_metrics(labels, probs) -> Dict[str, float]:
     return metrics
 
 
+def find_best_f1_threshold(probs, labels, n_steps: int = 200) -> tuple[float, float]:
+    probs = np.asarray(probs).astype(float)
+    labels = np.asarray(labels).astype(int)
+    if labels.sum() == 0:
+        return 0.5, 0.0
+
+    best_threshold = 0.5
+    best_f1 = 0.0
+    for threshold in np.linspace(0.01, 0.99, n_steps):
+        preds = (probs >= threshold).astype(int)
+        tp = float((preds * labels).sum())
+        fp = float((preds * (1 - labels)).sum())
+        fn = float(((1 - preds) * labels).sum())
+        precision = tp / max(1.0, tp + fp)
+        recall = tp / max(1.0, tp + fn)
+        f1 = 2 * precision * recall / max(1e-8, precision + recall)
+        if f1 > best_f1:
+            best_f1 = f1
+            best_threshold = float(threshold)
+    return best_threshold, float(best_f1)
+
+
 def compute_multilabel_metrics(labels, probs, label_names=None) -> Dict[str, float]:
     labels = np.asarray(labels).astype(int)
     probs = np.asarray(probs).astype(float)
@@ -91,30 +113,36 @@ def compute_multilabel_metrics(labels, probs, label_names=None) -> Dict[str, flo
         raise ValueError(f"label_names length {len(label_names)} != n_labels {n_labels}")
 
     out: Dict[str, float] = {}
-    per_acc, per_f1, per_auc = [], [], []
+    per_acc, per_f1, per_auc, per_best_f1 = [], [], [], []
     for i, name in enumerate(label_names):
         y = labels[:, i]
         p = probs[:, i]
         pred = (p >= 0.5).astype(int)
         acc = float(accuracy_score(y, pred))
         f1 = float(f1_score(y, pred, zero_division=0))
+        best_threshold, best_f1 = find_best_f1_threshold(p, y)
         if len(np.unique(y)) > 1:
             auc = float(roc_auc_score(y, p))
         else:
             auc = 0.5
         out[f"{name}_accuracy"] = acc
         out[f"{name}_f1"] = f1
+        out[f"{name}_best_threshold"] = best_threshold
+        out[f"{name}_best_f1"] = best_f1
         out[f"{name}_roc_auc"] = auc
         per_acc.append(acc)
         per_f1.append(f1)
         per_auc.append(auc)
+        per_best_f1.append(best_f1)
 
     out["macro_accuracy"] = float(np.mean(per_acc))
     out["macro_f1"] = float(np.mean(per_f1))
+    out["macro_best_f1"] = float(np.mean(per_best_f1))
     out["macro_roc_auc"] = float(np.mean(per_auc))
     # Alias for backward-compatible save_metric/print flow
     out["accuracy"] = out["macro_accuracy"]
     out["f1"] = out["macro_f1"]
+    out["best_f1"] = out["macro_best_f1"]
     out["roc_auc"] = out["macro_roc_auc"]
     return out
 
