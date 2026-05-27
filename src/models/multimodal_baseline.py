@@ -214,13 +214,11 @@ class WhisperAudioEncoder(nn.Module):
                 center=False, 
                 return_complex=True
             )
-            # stft shape: [B, 201, T] 
-            # 只有将最后一维取平方，得到 magnitudes shape: [B, 201, T]
-            # 为了能够与 _mel_filters [128, 201] 相乘，我们先把 magnitudes 转置
-            # magnitudes.transpose(1, 2) shape: [B, T, 201]
-            # _mel_filters 变成 [1, 201, 128]
-            # 或者直接 einsum: 
-            magnitudes = stft.abs() ** 2
+            magnitudes = stft.abs()[:, :-1, :] ** 2
+            
+            # _mel_filters 实际 shape 是 [128, 200]
+            # magnitudes shape 是 [Batch, 200, Time]
+            # einsum 确保乘法正确执行: (128, 200) 与 (Batch, 200, Time) 相乘 -> (Batch, 128, Time)
             mel_spec = torch.einsum("mf,bft->bmt", self._mel_filters.cpu(), magnitudes)
             log_spec = torch.clamp(mel_spec, min=1e-10).log10()
             log_spec = torch.maximum(log_spec, log_spec.max() - 8.0)
