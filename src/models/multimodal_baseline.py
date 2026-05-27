@@ -192,31 +192,41 @@ class WhisperAudioEncoder(nn.Module):
         self.out_dim = proj_dim
 
     def _build_input_features(self, wave_mono: torch.Tensor) -> torch.Tensor:
-        # 彻底解决 CPU 计算瓶颈：移除 Numpy，使用纯 PyTorch GPU 原生算子提取 Mel 频谱
+        # 为了兼容算力不支持导致部分 PyTorch Cuda Kernels (如 pad, stft) 报错的环境
+        # 我们把这段预处理放在 CPU 上执行
         if getattr(self, "_mel_filters", None) is None:
             filters = self.feature_extractor.mel_filters
             self.register_buffer("_mel_filters", torch.tensor(filters, dtype=torch.float32), persistent=False)
             self.register_buffer("_window", torch.hann_window(400), persistent=False)
-
-        # 补齐边缘 (Whisper 默认处理)
-        wave_mono = F.pad(wave_mono, (200, 200), mode="reflect")
+            
+        wave_mono_cpu = wave_mono.detach().cpu()
+        
+        # Whisper 要求特定的填充和 n_fft，默认提取 80 个 mel 频谱带
+        # 对于 openai/whisper-large-v3, 它的 feature_extractor.mel_filters 的 shape 是 [128, 201] (表示 128个mel频带, 对应 n_fft=400 时的 201 个频段)
+        wave_mono_cpu = F.pad(wave_mono_cpu, (200, 200), mode="reflect")
         
         with torch.amp.autocast("cuda", enabled=False):
             stft = torch.stft(
-                wave_mono.float(), 
+                wave_mono_cpu.float(), 
                 n_fft=400, 
                 hop_length=160, 
-                window=self._window.to(wave_mono.device), 
+                window=self._window.cpu(), 
                 center=False, 
                 return_complex=True
             )
-            magnitudes = stft.abs()[:, :-1, :] ** 2
-            mel_spec = torch.matmul(self._mel_filters.to(wave_mono.device), magnitudes)
+            # stft shape: [B, 201, T] 
+            # 只有将最后一维取平方，得到 magnitudes shape: [B, 201, T]
+            # 为了能够与 _mel_filters [128, 201] 相乘，我们先把 magnitudes 转置
+            # magnitudes.transpose(1, 2) shape: [B, T, 201]
+            # _mel_filters 变成 [1, 201, 128]
+            # 或者直接 einsum: 
+            magnitudes = stft.abs() ** 2
+            mel_spec = torch.einsum("mf,bft->bmt", self._mel_filters.cpu(), magnitudes)
             log_spec = torch.clamp(mel_spec, min=1e-10).log10()
             log_spec = torch.maximum(log_spec, log_spec.max() - 8.0)
             log_spec = (log_spec + 4.0) / 4.0
             
-        return log_spec
+        return log_spec.to(wave_mono.device)
 
     def forward(self, wave: torch.Tensor) -> torch.Tensor:
         # wave: [B, C, T]
