@@ -9,16 +9,16 @@ max_valid_samples: null
 num_workers: 8  # 增加 Dataloader workers 提高预加载效率，但在合理的范围以免影响 GPU 调度
 
 paths:
-  project_root: D:/bisai/2026_finvcup_baseline
-  train_audio_dir: D:/bisai/2026_finvcup_baseline/train/audio
-  train_text_dir: D:/bisai/2026_finvcup_baseline/train/text
-  train_labels_dir: D:/bisai/2026_finvcup_baseline/train/labels
+  project_root: /root/autodl-tmp/2026_finvcup_baseline
+  train_audio_dir: /root/autodl-tmp/2026_finvcup_baseline/train/audio
+  train_text_dir: /root/autodl-tmp/2026_finvcup_baseline/train/text
+  train_labels_dir: /root/autodl-tmp/2026_finvcup_baseline/train/labels
 
-  output_root: D:/bisai/2026_finvcup_baseline/outputs/rtx6000_96g
-  checkpoints_dir: D:/bisai/2026_finvcup_baseline/outputs/rtx6000_96g/checkpoints
-  logs_dir: D:/bisai/2026_finvcup_baseline/outputs/rtx6000_96g/logs
+  output_root: /root/autodl-tmp/2026_finvcup_baseline/outputs/rtx6000_96g
+  checkpoints_dir: /root/autodl-tmp/2026_finvcup_baseline/outputs/rtx6000_96g/checkpoints
+  logs_dir: /root/autodl-tmp/2026_finvcup_baseline/outputs/rtx6000_96g/logs
 
-  cache_root: D:/bisai/2026_finvcup_baseline/.cache
+  cache_root: /root/autodl-tmp/2026_finvcup_baseline/.cache
 
 labels:
   C: 0
@@ -86,7 +86,7 @@ train:
   early_stop_patience: 15
 
 env:
-  HF_HOME: D:/bisai/2026_finvcup_baseline/.cache/huggingface
-  TRANSFORMERS_CACHE: D:/bisai/2026_finvcup_baseline/.cache/huggingface
-  TORCH_HOME: D:/bisai/2026_finvcup_baseline/.cache/torch
+  HF_HOME: /root/autodl-tmp/2026_finvcup_baseline/.cache/huggingface
+  TRANSFORMERS_CACHE: /root/autodl-tmp/2026_finvcup_baseline/.cache/huggingface
+  TORCH_HOME: /root/autodl-tmp/2026_finvcup_baseline/.cache/torch
   HF_ENDPOINT: https://hf-mirror.com
