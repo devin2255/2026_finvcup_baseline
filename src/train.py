@@ -66,12 +66,16 @@ def evaluate(
         labels = batch["label"].to(device, non_blocking=True)
 
         with torch.amp.autocast("cuda", enabled=use_amp):
-            logits = model(
+            outputs = model(
                 waveform=waveform,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 context_labels=context_labels,
             )
+            if isinstance(outputs, tuple):
+                logits = outputs[0]
+            else:
+                logits = outputs
 
         probs = torch.sigmoid(logits)
         all_labels.extend(labels.detach().cpu().numpy().tolist())
@@ -382,13 +386,29 @@ def main():
             labels = batch["label"].to(device, non_blocking=True)
 
             with torch.amp.autocast("cuda", enabled=use_amp):
-                logits = model(
+                outputs = model(
                     waveform=waveform,
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     context_labels=context_labels,
                 )
-                loss = criterion(logits, labels) / accum_steps
+                if isinstance(outputs, tuple) and len(outputs) == 2:
+                    logits, vap_logits = outputs
+                else:
+                    logits, vap_logits = outputs, None
+                    
+                loss = criterion(logits, labels)
+                
+                # 方案2: VAP 辅助损失
+                if vap_logits is not None and "future_seq" in batch:
+                    future_seq = batch["future_seq"].to(device, non_blocking=True)
+                    vap_loss = torch.nn.functional.cross_entropy(
+                        vap_logits.view(-1, vap_logits.size(-1)), 
+                        future_seq.view(-1)
+                    )
+                    loss = loss + 0.5 * vap_loss
+                    
+                loss = loss / accum_steps
 
             if not torch.isfinite(loss):
                 if is_main:

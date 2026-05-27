@@ -25,6 +25,8 @@ class TrainSampleMulti:
     end_idx: int
     # (BC, I, T) or any configured order
     label_vec: Tuple[int, ...]
+    # 方案2: 辅助任务目标，未来25个chunk的具体类别序列
+    future_seq: Tuple[int, ...] = None
 
 
 def list_conv_ids(labels_dir: Path) -> List[str]:
@@ -83,10 +85,11 @@ def build_train_samples_multitask(
         for end_idx in range(context_chunks, max_end + 1, stride):
             future = labels[end_idx : end_idx + target_chunks]
             y_vec = tuple(int(any(int(x) == tid for x in future)) for tid in target_id_list)
-            samples.append(TrainSampleMulti(conv_id=conv_id, end_idx=end_idx, label_vec=y_vec))
+            # 方案2: 引入 VAP (Voice Activity Projection) 序列预测作为辅助任务
+            samples.append(TrainSampleMulti(conv_id=conv_id, end_idx=end_idx, label_vec=y_vec, future_seq=tuple(int(x) for x in future)))
             if max_samples is not None and len(samples) >= max_samples:
                 return samples
-    return samples
+        return samples
 
 
 def _speaker_token(channel_id: int) -> str:
@@ -248,6 +251,8 @@ class TurnTakingTrainDataset(Dataset):
         }
         if hasattr(sample, "label_vec"):
             out["label"] = torch.tensor(sample.label_vec, dtype=torch.float32)
+            if hasattr(sample, "future_seq") and sample.future_seq is not None:
+                out["future_seq"] = torch.tensor(sample.future_seq, dtype=torch.long)
         else:
             out["label"] = torch.tensor(float(sample.label), dtype=torch.float32)
         return out
@@ -338,6 +343,8 @@ class CollateFn:
 
         if "label" in batch[0]:
             out["label"] = torch.stack([b["label"] for b in batch], dim=0)
+            if "future_seq" in batch[0]:
+                out["future_seq"] = torch.stack([b["future_seq"] for b in batch], dim=0)
             out["conv_id"] = [b["conv_id"] for b in batch]
             out["end_idx"] = [b["end_idx"] for b in batch]
         else:
