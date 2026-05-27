@@ -192,13 +192,31 @@ class WhisperAudioEncoder(nn.Module):
         self.out_dim = proj_dim
 
     def _build_input_features(self, wave_mono: torch.Tensor) -> torch.Tensor:
-        mono_np = wave_mono.detach().float().cpu().numpy()
-        inputs = self.feature_extractor(
-            [x for x in mono_np],
-            sampling_rate=self.sample_rate,
-            return_tensors="pt",
-        )
-        return inputs["input_features"]
+        # 彻底解决 CPU 计算瓶颈：移除 Numpy，使用纯 PyTorch GPU 原生算子提取 Mel 频谱
+        if getattr(self, "_mel_filters", None) is None:
+            filters = self.feature_extractor.mel_filters
+            self.register_buffer("_mel_filters", torch.tensor(filters, dtype=torch.float32), persistent=False)
+            self.register_buffer("_window", torch.hann_window(400), persistent=False)
+
+        # 补齐边缘 (Whisper 默认处理)
+        wave_mono = F.pad(wave_mono, (200, 200), mode="reflect")
+        
+        with torch.amp.autocast("cuda", enabled=False):
+            stft = torch.stft(
+                wave_mono.float(), 
+                n_fft=400, 
+                hop_length=160, 
+                window=self._window.to(wave_mono.device), 
+                center=False, 
+                return_complex=True
+            )
+            magnitudes = stft.abs()[:, :-1, :] ** 2
+            mel_spec = torch.matmul(self._mel_filters.to(wave_mono.device), magnitudes)
+            log_spec = torch.clamp(mel_spec, min=1e-10).log10()
+            log_spec = torch.maximum(log_spec, log_spec.max() - 8.0)
+            log_spec = (log_spec + 4.0) / 4.0
+            
+        return log_spec
 
     def forward(self, wave: torch.Tensor) -> torch.Tensor:
         # wave: [B, C, T]
@@ -321,7 +339,7 @@ class HandcraftedFeatures(nn.Module):
 
 class TextEncoder(nn.Module):
     def __init__(self, model_name: str, freeze_backbone: bool = True,
-                 tail_ratio: float = 0.3):
+                 tail_ratio: float = 0.3, unfreeze_layers: int = 0):
         super().__init__()
         self.backbone = AutoModel.from_pretrained(model_name)
         self.out_dim = int(self.backbone.config.hidden_size)
@@ -329,6 +347,20 @@ class TextEncoder(nn.Module):
         if freeze_backbone:
             for p in self.backbone.parameters():
                 p.requires_grad = False
+                
+        if unfreeze_layers > 0 and freeze_backbone:
+            # 适配 Qwen 等大模型的层结构
+            layers = None
+            if hasattr(self.backbone, "model") and hasattr(self.backbone.model, "layers"):
+                layers = self.backbone.model.layers
+            elif hasattr(self.backbone, "encoder") and hasattr(self.backbone.encoder, "layer"):
+                layers = self.backbone.encoder.layer
+            
+            if layers is not None:
+                total_layers = len(layers)
+                for idx in range(max(0, total_layers - unfreeze_layers), total_layers):
+                    for p in layers[idx].parameters():
+                        p.requires_grad = True
         self.attn_pool = AttentionPooling(self.out_dim)
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
@@ -460,6 +492,7 @@ class MultimodalTurnTakingModel(nn.Module):
             model_name=cfg["text_encoder"]["model_name"],
             freeze_backbone=bool(cfg["text_encoder"].get("freeze_backbone", True)),
             tail_ratio=float(cfg["text_encoder"].get("tail_ratio", 0.3)),
+            unfreeze_layers=int(cfg["text_encoder"].get("unfreeze_layers", 0)),
         )
 
         ctx_cfg = cfg["context_encoder"]

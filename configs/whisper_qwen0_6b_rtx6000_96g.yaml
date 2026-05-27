@@ -1,0 +1,92 @@
+seed: 42
+chunk_ms: 80
+context_chunks: 375
+target_chunks: 25
+stride: 5
+sample_rate: 16000
+max_train_samples: null
+max_valid_samples: null
+num_workers: 8  # 增加 Dataloader workers 提高预加载效率，但在合理的范围以免影响 GPU 调度
+
+paths:
+  project_root: D:/bisai/2026_finvcup_baseline
+  train_audio_dir: D:/bisai/2026_finvcup_baseline/train/audio
+  train_text_dir: D:/bisai/2026_finvcup_baseline/train/text
+  train_labels_dir: D:/bisai/2026_finvcup_baseline/train/labels
+
+  output_root: D:/bisai/2026_finvcup_baseline/outputs/rtx6000_96g
+  checkpoints_dir: D:/bisai/2026_finvcup_baseline/outputs/rtx6000_96g/checkpoints
+  logs_dir: D:/bisai/2026_finvcup_baseline/outputs/rtx6000_96g/logs
+
+  cache_root: D:/bisai/2026_finvcup_baseline/.cache
+
+labels:
+  C: 0
+  T: 1
+  BC: 2
+  I: 3
+  NA: 4
+  positive_ids: [1, 2, 3]
+  multi_targets: [C, NA, I, BC, T]
+
+split:
+  valid_ratio: 0.1
+  by_conversation: true
+
+audio_encoder:
+  type: whisper
+  model_name: openai/whisper-large-v3
+  proj_dim: 512
+  freeze: true
+  unfreeze_layers: 4        # 96GB显存可以解冻更多层来微调
+  cross_attn_layers: 2      # 强化双通道声学交互 (方案1)
+
+text_encoder:
+  model_name: Qwen/Qwen3-0.6B
+  max_length: 256
+  freeze_backbone: true
+  unfreeze_layers: 2        # 96GB显存下稍微解冻几层文本编码器
+
+context_encoder:
+  vocab_size: 5
+  embed_dim: 16
+  channels: [32, 64]
+
+fusion:
+  hidden_dim: 256
+  bilinear_rank: 64         # 从48提高到64
+  dropout: 0.2
+
+train:
+  multi_label: true
+  pos_weight_mode: capped_per_label
+  pos_weight_cap: 5.0
+  focal_gamma: 1.0
+
+  epochs: 80
+  max_steps_per_epoch: 20000
+  eval_valid_sample_count: 4000
+  eval_valid_max_batches: null
+  eval_valid_shuffle: false
+
+  # RTX 6000 (96G VRAM) 专属批处理配置
+  batch_size: 16                    # 增大Batch Size
+  eval_batch_size: 16
+  gradient_accumulation_steps: 2    # 等效批量大小为 32
+  log_every_steps: 10
+
+  learning_rate: 1.0e-4             # Batch Size变大，稍微提高学习率
+  warmup_ratio: 0.02
+  ema_decay: 0.98
+  weight_decay: 0.01
+  grad_clip_norm: 1.0
+  use_amp: true                     # 混合精度
+  save_metric: best_f1
+  best_checkpoint_name: best_rtx6000.pt
+  early_stop_patience: 15
+
+env:
+  HF_HOME: D:/bisai/2026_finvcup_baseline/.cache/huggingface
+  TRANSFORMERS_CACHE: D:/bisai/2026_finvcup_baseline/.cache/huggingface
+  TORCH_HOME: D:/bisai/2026_finvcup_baseline/.cache/torch
+  HF_ENDPOINT: https://hf-mirror.com
