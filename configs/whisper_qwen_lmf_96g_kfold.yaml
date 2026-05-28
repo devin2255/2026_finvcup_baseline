@@ -13,16 +13,16 @@ num_workers: 8  # 提高 CPU 加载并行度
 
 paths:
   # 注意：在租用的服务器上，你需要修改这里的绝对路径，指向你挂载的数据集
-  project_root: /path/to/2026_finvcup_baseline
-  train_audio_dir: /path/to/2026_finvcup_baseline/train/audio
-  train_text_dir: /path/to/2026_finvcup_baseline/train/text
-  train_labels_dir: /path/to/2026_finvcup_baseline/train/labels
+  project_root: /root/autodl-tmp/2026_finvcup_baseline
+  train_audio_dir: /root/autodl-tmp/2026_finvcup_baseline/train/audio
+  train_text_dir: /root/autodl-tmp/2026_finvcup_baseline/train/text
+  train_labels_dir: /root/autodl-tmp/2026_finvcup_baseline/train/labels
 
-  output_root: /path/to/2026_finvcup_baseline/outputs/lmf_96g_kfold
-  checkpoints_dir: /path/to/2026_finvcup_baseline/outputs/lmf_96g_kfold/checkpoints
-  logs_dir: /path/to/2026_finvcup_baseline/outputs/lmf_96g_kfold/logs
+  output_root: /root/autodl-tmp/2026_finvcup_baseline/outputs/lmf_96g_kfold
+  checkpoints_dir: /root/autodl-tmp/2026_finvcup_baseline/outputs/lmf_96g_kfold/checkpoints
+  logs_dir: /root/autodl-tmp/2026_finvcup_baseline/outputs/lmf_96g_kfold/logs
 
-  cache_root: /path/to/2026_finvcup_baseline/.cache
+  cache_root: /root/autodl-tmp/2026_finvcup_baseline/.cache
 
 labels:
   C: 0
@@ -71,13 +71,13 @@ train:
   max_steps_per_epoch: 1000
   
   # 96G 算力自由，直接评测整折验证集，阈值最准
-  eval_valid_sample_count: null 
+  eval_valid_sample_count: 8000 
   eval_valid_max_batches: null
   eval_valid_shuffle: false
 
   # 🚀 96G 核心提速参数
   batch_size: 256
-  eval_batch_size: 320
+  eval_batch_size: 512
   log_every_steps: 10
   gradient_accumulation_steps: 1  # 真实 Batch Size = 256
 
@@ -99,7 +99,7 @@ train:
 
 env:
   # 注意：在租用的服务器上也要对应修改环境变量路径
-  HF_HOME: /path/to/2026_finvcup_baseline/.cache/huggingface
-  TRANSFORMERS_CACHE: /path/to/2026_finvcup_baseline/.cache/huggingface
-  TORCH_HOME: /path/to/2026_finvcup_baseline/.cache/torch
+  HF_HOME: /root/autodl-tmp/2026_finvcup_baseline/.cache/huggingface
+  TRANSFORMERS_CACHE: /root/autodl-tmp/2026_finvcup_baseline/.cache/huggingface
+  TORCH_HOME: /root/autodl-tmp/2026_finvcup_baseline/.cache/torch
   HF_ENDPOINT: https://hf-mirror.com
