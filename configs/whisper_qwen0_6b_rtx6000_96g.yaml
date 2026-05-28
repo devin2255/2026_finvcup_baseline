@@ -38,14 +38,14 @@ audio_encoder:
   model_name: openai/whisper-large-v3
   proj_dim: 512
   freeze: true
-  unfreeze_layers: 4        # 96GB显存可以解冻更多层来微调
+  unfreeze_layers: 8        # 进一步解冻更多层来微调 (从4提高到8)
   cross_attn_layers: 2      # 强化双通道声学交互 (方案1)
 
 text_encoder:
   model_name: Qwen/Qwen3-0.6B
   max_length: 256
   freeze_backbone: true
-  unfreeze_layers: 2        # 96GB显存下稍微解冻几层文本编码器
+  unfreeze_layers: 4        # 进一步解冻文本编码器 (从2提高到4)
 
 context_encoder:
   vocab_size: 5
@@ -70,9 +70,9 @@ train:
   eval_valid_shuffle: false
 
   # RTX 6000 (96G VRAM) 专属批处理配置
-  batch_size: 16                    # 增大Batch Size
-  eval_batch_size: 16
-  gradient_accumulation_steps: 2    # 等效批量大小为 32
+  batch_size: 32                    # 进一步增大Batch Size，充分利用显存
+  eval_batch_size: 32
+  gradient_accumulation_steps: 2    # 等效批量大小为 64
   log_every_steps: 10
 
   learning_rate: 1.0e-4             # Batch Size变大，稍微提高学习率

@@ -214,16 +214,27 @@ class WhisperAudioEncoder(nn.Module):
                 center=False, 
                 return_complex=True
             )
-            magnitudes = stft.abs()[:, :-1, :] ** 2
+            # stft.abs() shape: [B, 201, T] 
+            magnitudes = stft.abs() ** 2
             
-            # _mel_filters 实际 shape 是 [128, 200]
-            # magnitudes shape 是 [Batch, 200, Time]
-            # einsum 确保乘法正确执行: (128, 200) 与 (Batch, 200, Time) 相乘 -> (Batch, 128, Time)
-            mel_spec = torch.einsum("mf,bft->bmt", self._mel_filters.cpu(), magnitudes)
+            # _mel_filters 实际 shape 是 [201, 128]
+            # magnitudes shape 是 [Batch, 201, Time]
+            # einsum 确保乘法正确执行: f=201, m=128
+            # (201, 128) 与 (Batch, 201, Time) 相乘 -> (Batch, 128, Time)
+            mel_spec = torch.einsum("fm,bft->bmt", self._mel_filters.cpu(), magnitudes)
             log_spec = torch.clamp(mel_spec, min=1e-10).log10()
             log_spec = torch.maximum(log_spec, log_spec.max() - 8.0)
             log_spec = (log_spec + 4.0) / 4.0
             
+            # Whisper 模型严格要求输入特征的时间步为 3000
+            # 通常 30 秒音频提取出来的特征可能会多 1 帧或少 1 帧，我们需要对齐
+            expected_frames = 3000
+            current_frames = log_spec.shape[2]
+            if current_frames > expected_frames:
+                log_spec = log_spec[:, :, :expected_frames]
+            elif current_frames < expected_frames:
+                log_spec = F.pad(log_spec, (0, expected_frames - current_frames))
+                
         return log_spec.to(wave_mono.device)
 
     def forward(self, wave: torch.Tensor) -> torch.Tensor:
