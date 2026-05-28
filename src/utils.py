@@ -98,6 +98,65 @@ def find_best_f1_threshold(probs, labels, n_steps: int = 200) -> tuple[float, fl
     return best_threshold, float(best_f1)
 
 
+def _micro_f1_at_thresholds(
+    probs: np.ndarray, labels: np.ndarray, thresholds: np.ndarray
+) -> float:
+    preds = (probs >= thresholds[None, :]).astype(np.int8)
+    tp = float((preds * labels).sum())
+    fp = float((preds * (1 - labels)).sum())
+    fn = float(((1 - preds) * labels).sum())
+    precision = tp / max(1.0, tp + fp)
+    recall = tp / max(1.0, tp + fn)
+    return float(2 * precision * recall / max(1e-8, precision + recall))
+
+
+def _find_best_micro_f1_thresholds(
+    probs: np.ndarray,
+    labels: np.ndarray,
+    *,
+    rounds: int = 2,
+    n_steps: int = 100,
+) -> tuple[np.ndarray, float]:
+    """坐标轮转：先各自取 per-label F1 最优阈值作为起点，再做 1~2 轮逐维微调最大化 micro F1。
+
+    复杂度 O(rounds * C * n_steps * N)；N 为样本数。比较稳，但对 N>=2w 推荐 n_steps=80。
+    """
+    n_labels = probs.shape[1]
+    cur_thr = np.full(n_labels, 0.5, dtype=np.float64)
+    for j in range(n_labels):
+        t, _ = find_best_f1_threshold(probs[:, j], labels[:, j])
+        cur_thr[j] = t
+
+    best_micro = _micro_f1_at_thresholds(probs, labels, cur_thr)
+    grid = np.linspace(0.01, 0.99, n_steps)
+    for _ in range(rounds):
+        improved = False
+        for j in range(n_labels):
+            best_t = cur_thr[j]
+            for t in grid:
+                cur_thr[j] = t
+                m = _micro_f1_at_thresholds(probs, labels, cur_thr)
+                if m > best_micro + 1e-6:
+                    best_micro = m
+                    best_t = t
+                    improved = True
+            cur_thr[j] = best_t
+        if not improved:
+            break
+    return cur_thr, best_micro
+
+
+def _sample_f1(preds: np.ndarray, labels: np.ndarray) -> float:
+    """Sample-wise (per-row) F1，对每行取 F1 后求平均。"""
+    tp = (preds * labels).sum(axis=1)
+    fp = (preds * (1 - labels)).sum(axis=1)
+    fn = ((1 - preds) * labels).sum(axis=1)
+    precision = tp / np.maximum(1, tp + fp)
+    recall = tp / np.maximum(1, tp + fn)
+    f1 = 2 * precision * recall / np.maximum(1e-8, precision + recall)
+    return float(f1.mean())
+
+
 def compute_multilabel_metrics(labels, probs, label_names=None) -> Dict[str, float]:
     labels = np.asarray(labels).astype(int)
     probs = np.asarray(probs).astype(float)
@@ -114,6 +173,7 @@ def compute_multilabel_metrics(labels, probs, label_names=None) -> Dict[str, flo
 
     out: Dict[str, float] = {}
     per_acc, per_f1, per_auc, per_best_f1 = [], [], [], []
+    per_best_thr = np.zeros(n_labels, dtype=np.float64)
     for i, name in enumerate(label_names):
         y = labels[:, i]
         p = probs[:, i]
@@ -134,6 +194,28 @@ def compute_multilabel_metrics(labels, probs, label_names=None) -> Dict[str, flo
         per_f1.append(f1)
         per_auc.append(auc)
         per_best_f1.append(best_f1)
+        per_best_thr[i] = best_threshold
+
+    # === micro / sample-wise metrics（与线上 metric 更接近的口径）===
+    thr_05 = np.full(n_labels, 0.5, dtype=np.float64)
+    preds_05 = (probs >= thr_05[None, :]).astype(np.int8)
+    out["micro_f1"] = _micro_f1_at_thresholds(probs, labels, thr_05)
+    out["sample_f1"] = _sample_f1(preds_05, labels.astype(np.int8))
+
+    # 用 per-label-best 阈值再算一次 micro / sample（这是 thresholds 落盘后真实的指标）
+    preds_pl = (probs >= per_best_thr[None, :]).astype(np.int8)
+    out["micro_f1_at_perlabel_thr"] = _micro_f1_at_thresholds(probs, labels, per_best_thr)
+    out["sample_f1_at_perlabel_thr"] = _sample_f1(preds_pl, labels.astype(np.int8))
+
+    # 联合搜最优 micro F1 阈值（坐标轮转）
+    best_micro_thr, best_micro = _find_best_micro_f1_thresholds(
+        probs.astype(np.float32), labels.astype(np.int8), rounds=2, n_steps=80
+    )
+    out["best_micro_f1"] = float(best_micro)
+    preds_bm = (probs >= best_micro_thr[None, :]).astype(np.int8)
+    out["best_micro_sample_f1"] = _sample_f1(preds_bm, labels.astype(np.int8))
+    for i, name in enumerate(label_names):
+        out[f"{name}_best_micro_threshold"] = float(best_micro_thr[i])
 
     out["macro_accuracy"] = float(np.mean(per_acc))
     out["macro_f1"] = float(np.mean(per_f1))
@@ -201,6 +283,94 @@ def compute_gaussian_soft_f1_sequence(
         "soft_macro_f1": float(score.item()),
         "soft_f1_per_class_mean": float(f1.mean().item()),
     }
+
+
+def apply_label_constraints(
+    preds: list[int],
+    probs: list[float],
+    label_cols: list[str],
+) -> list[int]:
+    """Apply domain mutual-exclusion rules on multi-label predictions."""
+    out = list(preds)
+    name_to_idx = {name: idx for idx, name in enumerate(label_cols)}
+
+    na_idx = name_to_idx.get("na")
+    if na_idx is not None and out[na_idx] == 1:
+        for name in ("c", "i", "bc", "t"):
+            idx = name_to_idx.get(name)
+            if idx is not None:
+                out[idx] = 0
+
+    c_idx = name_to_idx.get("c")
+    t_idx = name_to_idx.get("t")
+    if c_idx is not None and t_idx is not None and out[c_idx] == 1 and out[t_idx] == 1:
+        if probs[c_idx] >= probs[t_idx]:
+            out[t_idx] = 0
+        else:
+            out[c_idx] = 0
+
+    return out
+
+
+def apply_label_constraints_v2(
+    preds: list[int],
+    probs: list[float],
+    label_cols: list[str],
+    *,
+    na_strong_thr: float = 0.6,
+    na_max_other_prob: float = 0.5,
+    ct_margin: float = 0.0,
+    allzero_fallback: str = "na",
+) -> list[int]:
+    """Softer constraints + all-zero fallback.
+
+    - NA 只在 (P(NA) >= na_strong_thr) 且其它 4 类的最大 prob < na_max_other_prob 时
+      才硬压制其它标签；否则保留 NA + 其它标签共存（线上 micro-F1 友好）。
+    - C/T 互斥仅在 |P(C) - P(T)| > ct_margin 时裁更弱的一方；否则两者都保留。
+    - 全 0 兜底：若 5 类预测都为 0，按 allzero_fallback 行为打开：
+        * "na"           → 强制 NA=1（最安全）
+        * "argmax"       → 把概率最大的那一类置 1
+        * "na_or_argmax" → 若 P(NA) 最大置 NA=1，否则置 argmax=1
+        * "none"         → 不做处理
+    """
+    out = list(preds)
+    name_to_idx = {name: idx for idx, name in enumerate(label_cols)}
+
+    na_idx = name_to_idx.get("na")
+    other_idxs = [name_to_idx[n] for n in ("c", "i", "bc", "t") if n in name_to_idx]
+
+    if na_idx is not None and out[na_idx] == 1 and other_idxs:
+        other_max_prob = max(float(probs[i]) for i in other_idxs)
+        if float(probs[na_idx]) >= na_strong_thr and other_max_prob < na_max_other_prob:
+            for i in other_idxs:
+                out[i] = 0
+
+    c_idx = name_to_idx.get("c")
+    t_idx = name_to_idx.get("t")
+    if c_idx is not None and t_idx is not None and out[c_idx] == 1 and out[t_idx] == 1:
+        diff = float(probs[c_idx]) - float(probs[t_idx])
+        if abs(diff) > ct_margin:
+            if diff >= 0:
+                out[t_idx] = 0
+            else:
+                out[c_idx] = 0
+
+    if sum(out) == 0 and allzero_fallback != "none":
+        if allzero_fallback == "na" and na_idx is not None:
+            out[na_idx] = 1
+        elif allzero_fallback == "argmax":
+            j = int(max(range(len(probs)), key=lambda k: float(probs[k])))
+            out[j] = 1
+        elif allzero_fallback == "na_or_argmax":
+            if na_idx is not None and na_idx == int(
+                max(range(len(probs)), key=lambda k: float(probs[k]))
+            ):
+                out[na_idx] = 1
+            else:
+                j = int(max(range(len(probs)), key=lambda k: float(probs[k])))
+                out[j] = 1
+
+    return out
 
 
 def save_json(path: Path, obj: Dict) -> None:

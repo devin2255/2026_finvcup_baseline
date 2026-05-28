@@ -120,11 +120,13 @@ class WhisperAudioEncoder(nn.Module):
         self, model_name: str, sample_rate: int, proj_dim: int,
         freeze: bool = True, tail_ratio: float = 0.2,
         unfreeze_layers: int = 0,
+        encode_tail_audio: bool = True,
     ):
         super().__init__()
         self.sample_rate = sample_rate
         self.freeze = freeze
         self.tail_ratio = tail_ratio
+        self.encode_tail_audio = bool(encode_tail_audio)
         self.feature_extractor = WhisperFeatureExtractor.from_pretrained(model_name)
         self.encoder = WhisperModel.from_pretrained(model_name).encoder
         if self.freeze:
@@ -145,12 +147,92 @@ class WhisperAudioEncoder(nn.Module):
             nn.GELU(),
         )
         self.out_dim = proj_dim
+        fe = self.feature_extractor
+        self.register_buffer(
+            "_mel_filters",
+            torch.as_tensor(fe.mel_filters, dtype=torch.float32),
+            persistent=False,
+        )
+        self._n_fft = int(fe.n_fft)
+        self._hop_length = int(fe.hop_length)
+        self._n_samples = int(getattr(fe, "n_samples", self.sample_rate * 30))
+        self._nb_max_frames = int(getattr(fe, "nb_max_frames", 3000))
+
+    def _wave_to_log_mel(
+        self,
+        mono: torch.Tensor,
+        *,
+        n_samples_target: int | None = None,
+        pad_log_to_max_frames: bool = True,
+    ) -> torch.Tensor:
+        """GPU log-mel features aligned with WhisperFeatureExtractor."""
+        target_samples = int(n_samples_target) if n_samples_target is not None else self._n_samples
+        if mono.shape[1] > target_samples:
+            mono = mono[:, :target_samples]
+        elif mono.shape[1] < target_samples:
+            mono = F.pad(mono, (0, target_samples - mono.shape[1]))
+
+        window = torch.hann_window(self._n_fft, device=mono.device, dtype=mono.dtype)
+        stft = torch.stft(
+            mono,
+            n_fft=self._n_fft,
+            hop_length=self._hop_length,
+            window=window,
+            return_complex=True,
+        )
+        magnitudes = stft.abs() ** 2
+        # HF stores mel_filters as (n_freq, n_mels); STFT magnitudes are (B, n_freq, T).
+        mel_filters = self._mel_filters.to(device=mono.device, dtype=magnitudes.dtype)
+        if mel_filters.shape[0] == magnitudes.shape[1]:
+            mel_filters = mel_filters.transpose(0, 1)
+        mel_spec = torch.matmul(mel_filters, magnitudes)
+        log_spec = torch.clamp(mel_spec, min=1e-10).log10()
+        log_spec = torch.maximum(
+            log_spec,
+            log_spec.amax(dim=(-2, -1), keepdim=True) - 8.0,
+        )
+        log_spec = (log_spec + 4.0) / 4.0
+
+        n_frames = log_spec.shape[-1]
+        if pad_log_to_max_frames:
+            if n_frames > self._nb_max_frames:
+                log_spec = log_spec[..., : self._nb_max_frames]
+            elif n_frames < self._nb_max_frames:
+                log_spec = F.pad(log_spec, (0, self._nb_max_frames - n_frames))
+        return log_spec
 
     def _build_input_features(self, wave: torch.Tensor) -> torch.Tensor:
-        mono = wave.mean(dim=1)
-        mono_np = mono.detach().float().cpu().numpy()
+        mono = wave.mean(dim=1).float()
+        if self.encode_tail_audio and (self.tail_ratio is not None) and self.tail_ratio > 0 and self.tail_ratio < 1:
+            # Encode only the tail audio segment to reduce Whisper encoder compute.
+            tail_samples = max(int(self._n_samples * float(self.tail_ratio)), self._n_fft)
+            if mono.shape[1] > tail_samples:
+                mono = mono[:, -tail_samples:]
+            elif mono.shape[1] < tail_samples:
+                mono = F.pad(mono, (0, tail_samples - mono.shape[1]))
+        if wave.is_cuda:
+            if self.encode_tail_audio and (self.tail_ratio is not None) and self.tail_ratio > 0 and self.tail_ratio < 1:
+                # Whisper requires fixed mel length (= self._nb_max_frames).
+                # We compute mel on only the tail waveform, then left-pad with zeros
+                # so the tail segment is right-aligned in the 3000-length sequence.
+                log_mel_tail = self._wave_to_log_mel(
+                    mono,
+                    n_samples_target=mono.shape[1],
+                    pad_log_to_max_frames=False,
+                )
+                n_frames = int(log_mel_tail.shape[-1])
+                if n_frames < self._nb_max_frames:
+                    pad_left = self._nb_max_frames - n_frames
+                    log_mel_tail = F.pad(log_mel_tail, (pad_left, 0))
+                elif n_frames > self._nb_max_frames:
+                    # Keep the most recent frames.
+                    log_mel_tail = log_mel_tail[..., -self._nb_max_frames:]
+                return log_mel_tail
+
+            return self._wave_to_log_mel(mono)
+        mono_np = mono.detach().cpu().numpy()
         inputs = self.feature_extractor(
-            [x for x in mono_np],
+            mono_np,
             sampling_rate=self.sample_rate,
             return_tensors="pt",
         )
@@ -158,7 +240,9 @@ class WhisperAudioEncoder(nn.Module):
 
     def forward(self, wave: torch.Tensor) -> torch.Tensor:
         with torch.amp.autocast("cuda", enabled=False):
-            input_features = self._build_input_features(wave).to(wave.device)
+            input_features = self._build_input_features(wave)
+            if not wave.is_cuda:
+                input_features = input_features.to(wave.device)
 
         if self.freeze and not self.encoder_has_trainable_layers:
             with torch.no_grad():
@@ -166,7 +250,9 @@ class WhisperAudioEncoder(nn.Module):
         else:
             hidden = self.encoder(input_features=input_features).last_hidden_state
 
-        # Only attend to the tail portion of the time axis
+        # Only attend to the tail portion of the time axis.
+        # When encode_tail_audio=True we right-align the tail mel; this keeps
+        # the pooling semantics consistent with the original tail selection.
         T = hidden.shape[1]
         tail_start = max(0, T - int(T * self.tail_ratio))
         tail_hidden = hidden[:, tail_start:, :]  # [B, tail_T, D]
@@ -257,7 +343,7 @@ class HandcraftedFeatures(nn.Module):
 
 class TextEncoder(nn.Module):
     def __init__(self, model_name: str, freeze_backbone: bool = True,
-                 tail_ratio: float = 0.3):
+                 tail_ratio: float = 0.3, unfreeze_layers: int = 0):
         super().__init__()
         self.backbone = AutoModel.from_pretrained(model_name)
         self.out_dim = int(self.backbone.config.hidden_size)
@@ -265,6 +351,22 @@ class TextEncoder(nn.Module):
         if freeze_backbone:
             for p in self.backbone.parameters():
                 p.requires_grad = False
+            
+            if unfreeze_layers > 0:
+                # Try to find the layers module
+                layers = None
+                if hasattr(self.backbone, "layers"):
+                    layers = self.backbone.layers
+                elif hasattr(self.backbone, "model") and hasattr(self.backbone.model, "layers"):
+                    layers = self.backbone.model.layers
+                elif hasattr(self.backbone, "transformer") and hasattr(self.backbone.transformer, "h"):
+                    layers = self.backbone.transformer.h
+                    
+                if layers is not None:
+                    total_layers = len(layers)
+                    for layer_idx in range(max(0, total_layers - unfreeze_layers), total_layers):
+                        for p in layers[layer_idx].parameters():
+                            p.requires_grad = True
         self.attn_pool = AttentionPooling(self.out_dim)
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
@@ -298,9 +400,11 @@ class MultimodalFusion(nn.Module):
         hidden_dim: int,
         bilinear_rank: int = 48,
         dropout: float = 0.2,
+        modality_dropout: float = 0.0,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
+        self.modality_dropout = float(modality_dropout)
 
         # Low-rank interaction over audio, text, context, and hand-crafted signals.
         self.low_rank_fusion = LowRankTensorFusion(
@@ -346,10 +450,25 @@ class MultimodalFusion(nn.Module):
         )
         self.out_dim = hidden_dim
 
+    def _maybe_drop_modality(self, feat: torch.Tensor) -> torch.Tensor:
+        if not self.training or self.modality_dropout <= 0:
+            return feat
+        drop_mask = torch.rand(feat.size(0), device=feat.device) < self.modality_dropout
+        if not drop_mask.any():
+            return feat
+        out = feat.clone()
+        out[drop_mask] = 0
+        return out
+
     def forward(
         self, audio: torch.Tensor, text: torch.Tensor,
         context: torch.Tensor, hand: torch.Tensor,
     ) -> torch.Tensor:
+        audio = self._maybe_drop_modality(audio)
+        text = self._maybe_drop_modality(text)
+        context = self._maybe_drop_modality(context)
+        hand = self._maybe_drop_modality(hand)
+
         # 1. Low-rank tensor interaction: joint space across all modalities
         interaction_feat = self.low_rank_proj(
             self.low_rank_fusion([audio, text, context, hand])
@@ -383,6 +502,7 @@ class MultimodalTurnTakingModel(nn.Module):
                 freeze=bool(cfg["audio_encoder"].get("freeze", True)),
                 tail_ratio=float(cfg["audio_encoder"].get("tail_ratio", 0.2)),
                 unfreeze_layers=int(cfg["audio_encoder"].get("unfreeze_layers", 0)),
+                encode_tail_audio=bool(cfg["audio_encoder"].get("encode_tail_audio", True)),
             )
         else:
             self.audio_encoder = AudioEncoder(
@@ -395,6 +515,7 @@ class MultimodalTurnTakingModel(nn.Module):
             model_name=cfg["text_encoder"]["model_name"],
             freeze_backbone=bool(cfg["text_encoder"].get("freeze_backbone", True)),
             tail_ratio=float(cfg["text_encoder"].get("tail_ratio", 0.3)),
+            unfreeze_layers=int(cfg["text_encoder"].get("unfreeze_layers", 0)),
         )
 
         ctx_cfg = cfg["context_encoder"]
@@ -419,6 +540,7 @@ class MultimodalTurnTakingModel(nn.Module):
             hidden_dim=int(fusion_cfg.get("hidden_dim", 256)),
             bilinear_rank=int(fusion_cfg.get("bilinear_rank", 48)),
             dropout=float(fusion_cfg.get("dropout", 0.2)),
+            modality_dropout=float(fusion_cfg.get("modality_dropout", 0.0)),
         )
 
         num_targets = len(cfg.get("labels", {}).get("multi_targets", []))

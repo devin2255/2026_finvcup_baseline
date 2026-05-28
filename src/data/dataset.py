@@ -42,6 +42,39 @@ def split_conversation_ids(
     return {"train": train_ids, "valid": valid_ids}
 
 
+def kfold_conversation_ids(
+    conv_ids: Sequence[str], num_folds: int, fold_idx: int, seed: int
+) -> Dict[str, List[str]]:
+    conv_ids = list(conv_ids)
+    random.Random(seed).shuffle(conv_ids)
+    valid_ids = [conv_ids[i] for i in range(len(conv_ids)) if i % num_folds == fold_idx]
+    train_ids = [conv_ids[i] for i in range(len(conv_ids)) if i % num_folds != fold_idx]
+    return {"train": sorted(train_ids), "valid": sorted(valid_ids)}
+
+
+def split_kfold(
+    conv_ids: Sequence[str], n_folds: int, fold_idx: int, seed: int
+) -> Dict[str, List[str] | int]:
+    """按对话 ID 做 K-Fold：fold_idx 为验证折，其余折合并为训练集。"""
+    if n_folds < 2:
+        raise ValueError(f"n_folds must be >= 2, got {n_folds}")
+    if fold_idx < 0 or fold_idx >= n_folds:
+        raise ValueError(f"fold_idx must be in [0, {n_folds}), got {fold_idx}")
+    conv_ids = list(conv_ids)
+    random.Random(seed).shuffle(conv_ids)
+    folds: List[List[str]] = [[] for _ in range(n_folds)]
+    for i, cid in enumerate(conv_ids):
+        folds[i % n_folds].append(cid)
+    valid_ids = sorted(folds[fold_idx])
+    train_ids = sorted(cid for j, chunk in enumerate(folds) for cid in chunk if j != fold_idx)
+    return {
+        "train": train_ids,
+        "valid": valid_ids,
+        "fold_idx": fold_idx,
+        "n_folds": n_folds,
+    }
+
+
 def build_train_samples(
     labels_dir: Path,
     conv_ids: Sequence[str],
@@ -166,6 +199,7 @@ class TurnTakingTrainDataset(Dataset):
         chunk_ms: int,
         sample_rate: int,
         augment_audio: bool = True,
+        audio_tail_ratio: Optional[float] = None,
     ) -> None:
         self.samples = list(samples)
         self.train_audio_dir = train_audio_dir
@@ -176,6 +210,9 @@ class TurnTakingTrainDataset(Dataset):
         self.chunk_ms = chunk_ms
         self.sample_rate = sample_rate
         self.augment_audio = augment_audio
+        if audio_tail_ratio is not None and not (0.0 < float(audio_tail_ratio) < 1.0):
+            audio_tail_ratio = None
+        self.audio_tail_ratio = audio_tail_ratio
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -236,7 +273,11 @@ class TurnTakingTrainDataset(Dataset):
 
         text_json = self._load_text_json(sample.conv_id)
         text = build_text_context(text_json.get("utterances", []), start_ms, end_ms)
-        wave = self._load_wave_segment(sample.conv_id, start_ms, end_ms)
+        audio_start_ms = start_ms
+        if self.audio_tail_ratio is not None:
+            span_ms = end_ms - start_ms
+            audio_start_ms = end_ms - max(self.chunk_ms, int(span_ms * self.audio_tail_ratio))
+        wave = self._load_wave_segment(sample.conv_id, audio_start_ms, end_ms)
         wave = self._augment_audio(wave)
 
         out = {

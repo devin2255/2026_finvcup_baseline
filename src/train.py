@@ -15,11 +15,16 @@ from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 from src.data import (
     TurnTakingTrainDataset,
     build_collate_fn,
+    build_label_weighted_sampler,
     build_train_samples_multitask,
     list_conv_ids,
     split_conversation_ids,
+    kfold_conversation_ids,
+    summarize_weights,
 )
 from src.models import MultimodalTurnTakingModel
+from src.ema import CPUEMA, ModelEMA
+from src.losses import build_criterion
 from src.utils import (
     cleanup_distributed,
     compute_multilabel_metrics,
@@ -42,6 +47,10 @@ def parse_args():
     p.add_argument("--max_steps_per_epoch", type=int, default=None)
     p.add_argument("--max_train_samples", type=int, default=None)
     p.add_argument("--max_valid_samples", type=int, default=None)
+    p.add_argument("--eval_valid_sample_count", type=int, default=None)
+    p.add_argument("--eval_valid_max_batches", type=int, default=None)
+    p.add_argument("--num_folds", type=int, default=1, help="K-Fold 交叉验证的总折数")
+    p.add_argument("--fold_idx", type=int, default=0, help="当前运行的是第几折 (0 到 num_folds-1)")
     return p.parse_args()
 
 
@@ -105,6 +114,19 @@ def _get_best_checkpoint_name(cfg: dict) -> str:
     return str(cfg.get("train", {}).get("best_checkpoint_name", "best.pt"))
 
 
+def _get_audio_tail_ratio(cfg: dict) -> float | None:
+    """When Whisper uses tail encoding, only read tail audio from disk."""
+    audio_cfg = cfg.get("audio_encoder", {})
+    if str(audio_cfg.get("type", "cnn")).lower() != "whisper":
+        return None
+    if not bool(audio_cfg.get("encode_tail_audio", True)):
+        return None
+    ratio = float(audio_cfg.get("tail_ratio", 1.0))
+    if ratio >= 1.0:
+        return None
+    return ratio
+
+
 def _select_eval_samples(samples: list, cfg: dict, seed: int) -> list:
     sample_count = cfg.get("train", {}).get("eval_valid_sample_count", None)
     if sample_count is None:
@@ -116,8 +138,44 @@ def _select_eval_samples(samples: list, cfg: dict, seed: int) -> list:
     return [samples[i] for i in indices]
 
 
-def _extract_best_thresholds(metrics: dict, label_names: list[str]) -> dict[str, float]:
-    return {name: float(metrics.get(f"{name}_best_threshold", 0.5)) for name in label_names}
+def _extract_best_thresholds(
+    metrics: dict, label_names: list[str], *, key: str = "best_threshold"
+) -> dict[str, float]:
+    return {name: float(metrics.get(f"{name}_{key}", 0.5)) for name in label_names}
+
+
+def _threshold_key_for_save_metric(save_metric: str) -> str:
+    """根据 save_metric 选择落盘阈值口径，保证 best.pt 里的 thresholds 与选 ckpt 的目标一致。"""
+    s = save_metric.lower()
+    if "micro" in s:
+        return "best_micro_threshold"
+    return "best_threshold"
+
+
+def _build_optimizer(model, cfg: dict) -> torch.optim.AdamW:
+    head_lr = float(cfg["train"]["learning_rate"])
+    backbone_lr = float(cfg["train"].get("backbone_learning_rate", head_lr * 0.1))
+    weight_decay = float(cfg["train"]["weight_decay"])
+
+    backbone_params: list[torch.nn.Parameter] = []
+    head_params: list[torch.nn.Parameter] = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if ".backbone." in name or ".encoder.layers." in name:
+            backbone_params.append(param)
+        else:
+            head_params.append(param)
+
+    if backbone_params:
+        return torch.optim.AdamW(
+            [
+                {"params": backbone_params, "lr": backbone_lr},
+                {"params": head_params, "lr": head_lr},
+            ],
+            weight_decay=weight_decay,
+        )
+    return torch.optim.AdamW(head_params, lr=head_lr, weight_decay=weight_decay)
 
 
 def main():
@@ -126,6 +184,8 @@ def main():
     set_env_paths(cfg)
     ensure_dirs(cfg)
     set_seed(int(cfg["seed"]))
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
 
     # CLI overrides (for smoke runs)
     if args.epochs is not None:
@@ -136,11 +196,23 @@ def main():
         cfg["max_train_samples"] = int(args.max_train_samples)
     if args.max_valid_samples is not None:
         cfg["max_valid_samples"] = int(args.max_valid_samples)
+    if args.eval_valid_sample_count is not None:
+        cfg["train"]["eval_valid_sample_count"] = int(args.eval_valid_sample_count)
+    if args.eval_valid_max_batches is not None:
+        cfg["train"]["eval_valid_max_batches"] = int(args.eval_valid_max_batches)
 
     local_rank, world_size, rank = setup_distributed()
     is_main = rank == 0
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     writer = None
+    if is_main:
+        print(f"[train] device={device} cuda_available={torch.cuda.is_available()}")
+        if torch.cuda.is_available():
+            print(f"[train] gpu={torch.cuda.get_device_name(device)}")
+        if not torch.cuda.is_available():
+            print(
+                "[WARN] CUDA 不可用，Whisper-large + Qwen 在 CPU 上会非常慢（可能数小时/step）。"
+            )
 
     paths = cfg["paths"]
     labels_dir = Path(paths["train_labels_dir"])
@@ -148,11 +220,27 @@ def main():
     train_text_dir = Path(paths["train_text_dir"])
 
     conv_ids = list_conv_ids(labels_dir)
-    split_ids = split_conversation_ids(
-        conv_ids=conv_ids,
-        valid_ratio=float(cfg["split"]["valid_ratio"]),
-        seed=int(cfg["seed"]),
-    )
+    
+    if args.num_folds > 1:
+        if is_main:
+            print(f"[train] K-Fold CV enabled: num_folds={args.num_folds}, fold_idx={args.fold_idx}")
+        split_ids = kfold_conversation_ids(
+            conv_ids=conv_ids,
+            num_folds=args.num_folds,
+            fold_idx=args.fold_idx,
+            seed=int(cfg["seed"]),
+        )
+        # 把日志和模型前缀加上 fold_idx，避免多折互相覆盖
+        paths["logs_dir"] = str(Path(paths["logs_dir"]) / f"fold_{args.fold_idx}")
+        paths["checkpoints_dir"] = str(Path(paths["checkpoints_dir"]) / f"fold_{args.fold_idx}")
+        ensure_dirs(cfg)
+    else:
+        split_ids = split_conversation_ids(
+            conv_ids=conv_ids,
+            valid_ratio=float(cfg["split"]["valid_ratio"]),
+            seed=int(cfg["seed"]),
+        )
+    
     train_ids, valid_ids = split_ids["train"], split_ids["valid"]
     # Baseline 固化：只做 event-level 多标签（未来 2s 内 5 个标签分别是否出现）
     use_multi_label = True
@@ -199,6 +287,9 @@ def main():
     if tokenizer.pad_token is None and tokenizer.eos_token is not None:
         tokenizer.pad_token = tokenizer.eos_token
     collate_fn = build_collate_fn(tokenizer, int(cfg["text_encoder"]["max_length"]))
+    audio_tail_ratio = _get_audio_tail_ratio(cfg)
+    if is_main and audio_tail_ratio is not None:
+        print(f"[train] load only last {audio_tail_ratio:.0%} audio from disk per sample")
 
     train_dataset = TurnTakingTrainDataset(
         samples=train_samples,
@@ -210,6 +301,7 @@ def main():
         chunk_ms=int(cfg["chunk_ms"]),
         sample_rate=int(cfg["sample_rate"]),
         augment_audio=True,
+        audio_tail_ratio=audio_tail_ratio,
     )
     valid_dataset = TurnTakingTrainDataset(
         samples=valid_eval_samples,
@@ -221,29 +313,58 @@ def main():
         chunk_ms=int(cfg["chunk_ms"]),
         sample_rate=int(cfg["sample_rate"]),
         augment_audio=False,
+        audio_tail_ratio=audio_tail_ratio,
     )
 
-    train_sampler = (
-        DistributedSampler(train_dataset, shuffle=True) if is_distributed() else None
-    )
+    sampler_cfg = cfg["train"].get("sampler", {}) or {}
+    use_weighted = bool(sampler_cfg.get("type", "uniform") == "weighted")
+    if is_distributed():
+        # 当前 weighted sampler 不直接兼容 DDP；DDP 路径继续走默认随机 sampler。
+        if use_weighted and is_main:
+            print("[train][WARN] sampler.type=weighted ignored under DDP, use uniform.")
+        train_sampler = DistributedSampler(train_dataset, shuffle=True)
+    elif use_weighted:
+        wsum = summarize_weights(
+            train_samples,
+            alpha=float(sampler_cfg.get("alpha", 0.5)),
+            max_weight=float(sampler_cfg.get("max_weight", 8.0)),
+        )
+        if is_main:
+            print(f"[train] weighted sampler: {wsum}")
+            save_json(Path(paths["logs_dir"]) / "weighted_sampler_summary.json", wsum)
+        train_sampler = build_label_weighted_sampler(
+            train_samples,
+            alpha=float(sampler_cfg.get("alpha", 0.5)),
+            max_weight=float(sampler_cfg.get("max_weight", 8.0)),
+            num_samples=sampler_cfg.get("num_samples", None),
+            seed=int(cfg["seed"]),
+        )
+    else:
+        train_sampler = None
+    num_workers = int(cfg["num_workers"])
+    loader_common = {
+        "num_workers": num_workers,
+        "collate_fn": collate_fn,
+        "pin_memory": True,
+    }
+    if num_workers > 0:
+        loader_common["persistent_workers"] = True
+        loader_common["prefetch_factor"] = int(cfg.get("prefetch_factor", 2))
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=int(cfg["train"]["batch_size"]),
         sampler=train_sampler,
         shuffle=train_sampler is None,
-        num_workers=int(cfg["num_workers"]),
-        collate_fn=collate_fn,
-        pin_memory=True,
         drop_last=True,
+        **loader_common,
     )
 
     valid_loader = DataLoader(
         valid_dataset,
         batch_size=int(cfg["train"]["eval_batch_size"]),
         shuffle=_get_valid_loader_shuffle(cfg),
-        num_workers=int(cfg["num_workers"]),
-        collate_fn=collate_fn,
-        pin_memory=True,
+        **loader_common,
     )
 
     # 训练阶段完全不考虑测试集：不加载、不评估
@@ -276,38 +397,16 @@ def main():
     else:
         pos_weight = torch.ones(len(multi_targets), device=device, dtype=torch.float32)
 
-    focal_gamma = float(cfg["train"].get("focal_gamma", 0.0))
-    if focal_gamma > 0:
-        # Focal Loss: down-weight easy examples, forcing the model to focus on
-        # hard/rare labels like BC (3.65%) and I (14.15%).
-        class MultiLabelFocalLoss(torch.nn.Module):
-            def __init__(self, gamma, pos_weight):
-                super().__init__()
-                self.gamma = gamma
-                self.register_buffer("pos_weight", pos_weight)
-
-            def forward(self, logits, targets):
-                bce = torch.nn.functional.binary_cross_entropy_with_logits(
-                    logits, targets, reduction="none", pos_weight=self.pos_weight,
-                )
-                probs = torch.sigmoid(logits)
-                p_t = targets * probs + (1 - targets) * (1 - probs)
-                return ((1 - p_t) ** self.gamma * bce).mean()
-
-        criterion = MultiLabelFocalLoss(focal_gamma, pos_weight)
-    else:
-        criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    criterion = build_criterion(cfg["train"], pos_weight)
+    if is_main:
+        print(f"[train] criterion = {criterion.__class__.__name__}")
 
     max_steps_per_epoch_cfg = cfg["train"].get("max_steps_per_epoch", None)
     max_steps_per_epoch = (
         int(max_steps_per_epoch_cfg) if max_steps_per_epoch_cfg is not None else None
     )
 
-    optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=float(cfg["train"]["learning_rate"]),
-        weight_decay=float(cfg["train"]["weight_decay"]),
-    )
+    optimizer = _build_optimizer(model, cfg)
     max_epochs = int(cfg["train"]["epochs"])
     accum_steps = int(cfg["train"]["gradient_accumulation_steps"])
     steps_per_epoch_for_sched = (
@@ -330,6 +429,7 @@ def main():
     start_epoch = 0
     best_metric = -math.inf
     best_path = Path(paths["checkpoints_dir"]) / _get_best_checkpoint_name(cfg)
+    ckpt = None
     if args.resume:
         ckpt = torch.load(args.resume, map_location="cpu")
         target_model = model.module if hasattr(model, "module") else model
@@ -341,23 +441,55 @@ def main():
         start_epoch = int(ckpt["epoch"]) + 1
         best_metric = float(ckpt.get("best_metric", -math.inf))
 
+    target_model = model.module if hasattr(model, "module") else model
+    ema_decay_model = float(cfg["train"].get("model_ema_decay", 0.0))
+    ema_device = str(cfg["train"].get("model_ema_device", "cpu")).lower()
+    model_ema = None
+    if ema_decay_model > 0 and is_main:
+        if ema_device == "gpu":
+            model_ema = ModelEMA(target_model, decay=ema_decay_model)
+            if ckpt is not None and ckpt.get("model_ema") is not None:
+                model_ema.module.load_state_dict(ckpt["model_ema"])
+        else:
+            model_ema = CPUEMA(target_model, decay=ema_decay_model)
+            if ckpt is not None and ckpt.get("model_ema") is not None:
+                model_ema.load_state_dict(ckpt["model_ema"])
+        if is_main:
+            print(
+                f"[train] EMA enabled: {type(model_ema).__name__} decay={ema_decay_model} "
+                f"device={'gpu' if isinstance(model_ema, ModelEMA) else 'cpu'}"
+            )
+
     grad_clip = float(cfg["train"]["grad_clip_norm"])
     use_amp = bool(cfg["train"]["use_amp"])
     save_metric = str(cfg["train"]["save_metric"])
     early_stop_patience = int(cfg["train"]["early_stop_patience"])
+    save_topk = int(cfg["train"].get("save_topk", 1))
+    # 每项 = (metric_value, epoch, path)
+    topk_records: list[tuple[float, int, Path]] = []
     bad_epochs = 0
     # 真实训练步数（不受 len(train_loader) 误导）；用于 TensorBoard / 打印
     global_train_step = 0
 
     for epoch in range(start_epoch, max_epochs):
         model.train()
-        if train_sampler is not None:
+        if train_sampler is not None and hasattr(train_sampler, "set_epoch"):
             train_sampler.set_epoch(epoch)
         optimizer.zero_grad(set_to_none=True)
 
+        steps_this_epoch = (
+            min(len(train_loader), max_steps_per_epoch)
+            if max_steps_per_epoch is not None
+            else len(train_loader)
+        )
         iterator = train_loader
         if is_main:
-            iterator = tqdm(train_loader, desc=f"train epoch {epoch}", leave=False)
+            iterator = tqdm(
+                train_loader,
+                total=steps_this_epoch,
+                desc=f"train epoch {epoch}",
+                leave=False,
+            )
 
         epoch_loss_sum = 0.0
         epoch_step_count = 0
@@ -407,25 +539,6 @@ def main():
             global_step = global_train_step
             loss_ema = loss_value if loss_ema is None else (ema_decay * loss_ema + (1.0 - ema_decay) * loss_value)
 
-            with torch.no_grad():
-                probs = torch.sigmoid(logits.detach())
-                batch_pos_rate = float(labels.float().mean().item())
-                prob_mean = float(probs.mean().item())
-                prob_std = float(probs.std(unbiased=False).item())
-                logit_mean = float(logits.detach().mean().item())
-                logit_std = float(logits.detach().std(unbiased=False).item())
-                # Per-batch diagnostic: split loss by positive/negative entries.
-                per_entry = torch.nn.functional.binary_cross_entropy_with_logits(
-                    logits.detach(),
-                    labels,
-                    reduction="none",
-                    pos_weight=pos_weight,
-                )
-                pos_mask = labels > 0.5
-                neg_mask = ~pos_mask
-                pos_loss = float(per_entry[pos_mask].mean().item()) if pos_mask.any() else 0.0
-                neg_loss = float(per_entry[neg_mask].mean().item()) if neg_mask.any() else 0.0
-
             if (step + 1) % accum_steps == 0:
                 scaler.unscale_(optimizer)
                 grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip).item())
@@ -434,11 +547,30 @@ def main():
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 update_step += 1
+                if model_ema is not None:
+                    model_ema.update(target_model)
             else:
                 grad_norm = float("nan")
 
             if is_main and (step + 1) % log_every == 0:
                 lr_now = float(optimizer.param_groups[0]["lr"])
+                with torch.no_grad():
+                    probs = torch.sigmoid(logits.detach())
+                    batch_pos_rate = float(labels.float().mean().item())
+                    prob_mean = float(probs.mean().item())
+                    prob_std = float(probs.std(unbiased=False).item())
+                    logit_mean = float(logits.detach().mean().item())
+                    logit_std = float(logits.detach().std(unbiased=False).item())
+                    per_entry = torch.nn.functional.binary_cross_entropy_with_logits(
+                        logits.detach(),
+                        labels,
+                        reduction="none",
+                        pos_weight=pos_weight,
+                    )
+                    pos_mask = labels > 0.5
+                    neg_mask = ~pos_mask
+                    pos_loss = float(per_entry[pos_mask].mean().item()) if pos_mask.any() else 0.0
+                    neg_loss = float(per_entry[neg_mask].mean().item()) if neg_mask.any() else 0.0
                 if writer is not None:
                     writer.add_scalar("train/loss_step", loss_value, global_step)
                     writer.add_scalar("train/loss_ema", float(loss_ema), global_step)
@@ -476,31 +608,61 @@ def main():
         skip_epoch_end_eval = False
 
         if is_main:
-            eval_model = model.module if hasattr(model, "module") else model
-            metrics_valid = evaluate(
-                eval_model,
-                valid_loader,
-                device,
-                use_amp=use_amp,
-                label_names=metric_label_names if use_multi_label else None,
-                max_batches=eval_valid_max_batches,
-            )
+            base_model = model.module if hasattr(model, "module") else model
+            if isinstance(model_ema, ModelEMA):
+                eval_model = model_ema.module
+                _ema_applied = False
+            elif isinstance(model_ema, CPUEMA):
+                # 把 EMA 灌进 base_model 评估，评估完再恢复原训练权重
+                model_ema.apply_to(base_model)
+                eval_model = base_model
+                _ema_applied = True
+            else:
+                eval_model = base_model
+                _ema_applied = False
+
+            try:
+                metrics_valid = evaluate(
+                    eval_model,
+                    valid_loader,
+                    device,
+                    use_amp=use_amp,
+                    label_names=metric_label_names if use_multi_label else None,
+                    max_batches=eval_valid_max_batches,
+                )
+            finally:
+                if _ema_applied:
+                    model_ema.restore(base_model)
             metrics_test_epoch = None
 
+            if save_metric not in metrics_valid:
+                raise KeyError(
+                    f"save_metric '{save_metric}' not in metrics_valid; "
+                    f"available={sorted(metrics_valid.keys())}"
+                )
             metric_value = float(metrics_valid[save_metric])
             save_json(Path(paths["logs_dir"]) / f"valid_epoch_{epoch}.json", metrics_valid)
-            # 兼容旧脚本读取路径
             save_json(Path(paths["logs_dir"]) / f"eval_epoch_{epoch}.json", metrics_valid)
-            valid_thresholds = _extract_best_thresholds(metrics_valid, metric_label_names)
-            save_json(Path(paths["logs_dir"]) / f"thresholds_epoch_{epoch}.json", {"thresholds": valid_thresholds})
+            thr_key = _threshold_key_for_save_metric(save_metric)
+            valid_thresholds = _extract_best_thresholds(
+                metrics_valid, metric_label_names, key=thr_key
+            )
+            save_json(
+                Path(paths["logs_dir"]) / f"thresholds_epoch_{epoch}.json",
+                {"thresholds": valid_thresholds, "threshold_key": thr_key},
+            )
             if use_multi_label:
                 valid_per_label = _format_multilabel_metrics_line(metrics_valid, metric_label_names)
                 print(
                     f"[Epoch {epoch}] train_loss={epoch_loss_sum / max(1, epoch_step_count):.6f} "
-                    f"valid_macro_acc={metrics_valid['macro_accuracy']:.4f} "
-                    f"valid_macro_f1={metrics_valid['macro_f1']:.4f} "
-                    f"valid_macro_best_f1={metrics_valid['macro_best_f1']:.4f} "
-                    f"valid_macro_auc={metrics_valid['macro_roc_auc']:.4f} "
+                    f"macro_f1={metrics_valid['macro_f1']:.4f} "
+                    f"macro_best_f1={metrics_valid['macro_best_f1']:.4f} "
+                    f"micro_f1@0.5={metrics_valid['micro_f1']:.4f} "
+                    f"micro_f1@plt={metrics_valid['micro_f1_at_perlabel_thr']:.4f} "
+                    f"best_micro_f1={metrics_valid['best_micro_f1']:.4f} "
+                    f"sample_f1@plt={metrics_valid['sample_f1_at_perlabel_thr']:.4f} "
+                    f"best_micro_sample={metrics_valid['best_micro_sample_f1']:.4f} "
+                    f"macro_auc={metrics_valid['macro_roc_auc']:.4f} "
                     f"| valid[{valid_per_label}] "
                     f"best_{save_metric}={max(best_metric, metric_value):.4f}"
                 )
@@ -518,6 +680,21 @@ def main():
                     writer.add_scalar("valid/macro_f1", metrics_valid["macro_f1"], epoch)
                     writer.add_scalar("valid/macro_best_f1", metrics_valid["macro_best_f1"], epoch)
                     writer.add_scalar("valid/macro_roc_auc", metrics_valid["macro_roc_auc"], epoch)
+                    writer.add_scalar("valid/micro_f1@0.5", metrics_valid["micro_f1"], epoch)
+                    writer.add_scalar(
+                        "valid/micro_f1@perlabel_thr",
+                        metrics_valid["micro_f1_at_perlabel_thr"], epoch,
+                    )
+                    writer.add_scalar("valid/best_micro_f1", metrics_valid["best_micro_f1"], epoch)
+                    writer.add_scalar("valid/sample_f1@0.5", metrics_valid["sample_f1"], epoch)
+                    writer.add_scalar(
+                        "valid/sample_f1@perlabel_thr",
+                        metrics_valid["sample_f1_at_perlabel_thr"], epoch,
+                    )
+                    writer.add_scalar(
+                        "valid/best_micro_sample_f1",
+                        metrics_valid["best_micro_sample_f1"], epoch,
+                    )
                     for n in metric_label_names:
                         writer.add_scalar(f"valid/{n}_accuracy", metrics_valid[f"{n}_accuracy"], epoch)
                         writer.add_scalar(f"valid/{n}_f1", metrics_valid[f"{n}_f1"], epoch)
@@ -529,6 +706,21 @@ def main():
                     writer.add_scalar("valid/f1", metrics_valid["f1"], epoch)
                     writer.add_scalar("valid/roc_auc", metrics_valid["roc_auc"], epoch)
 
+            # 我们想保存的"评估时所用"权重：
+            #  - 启用 CPUEMA：用 shadow（即评估时灌进去的那份）
+            #  - 启用 ModelEMA：用 module.state_dict()
+            #  - 否则：base_model.state_dict()
+            if isinstance(model_ema, CPUEMA):
+                model_state_for_save = {k: v.detach().clone() for k, v in model_ema.shadow.items()}
+                model_ema_state_for_save = model_state_for_save
+            elif isinstance(model_ema, ModelEMA):
+                model_state_for_save = model_ema.module.state_dict()
+                model_ema_state_for_save = model_state_for_save
+            else:
+                base_model = model.module if hasattr(model, "module") else model
+                model_state_for_save = base_model.state_dict()
+                model_ema_state_for_save = None
+
             if metric_value > best_metric:
                 bad_epochs = 0
                 best_metric = metric_value
@@ -536,7 +728,8 @@ def main():
                     {
                         "epoch": epoch,
                         "best_metric": best_metric,
-                        "model": eval_model.state_dict(),
+                        "model": model_state_for_save,
+                        "model_ema": model_ema_state_for_save,
                         "optimizer": optimizer.state_dict(),
                         "scheduler": scheduler.state_dict(),
                         "scaler": scaler.state_dict(),
@@ -548,8 +741,50 @@ def main():
                 save_json(Path(paths["logs_dir"]) / "best_thresholds.json", {"thresholds": valid_thresholds})
             else:
                 bad_epochs += 1
-                if bad_epochs >= early_stop_patience:
-                    break
+
+            # Top-K 快照：与 best 并行，不替换 best_path；用于后续 epoch-ensemble
+            if save_topk > 1:
+                topk_dir = Path(paths["checkpoints_dir"]) / "topk"
+                topk_dir.mkdir(parents=True, exist_ok=True)
+                snap_path = topk_dir / f"epoch_{epoch:03d}_metric{metric_value:.4f}.pt"
+                should_save = (
+                    len(topk_records) < save_topk
+                    or metric_value > min(r[0] for r in topk_records)
+                )
+                if should_save:
+                    torch.save(
+                        {
+                            "epoch": epoch,
+                            "best_metric": metric_value,
+                            "model": model_state_for_save,
+                            "model_ema": model_ema_state_for_save,
+                            "config": cfg,
+                            "thresholds": valid_thresholds,
+                        },
+                        snap_path,
+                    )
+                    topk_records.append((metric_value, epoch, snap_path))
+                    topk_records.sort(key=lambda r: -r[0])
+                    while len(topk_records) > save_topk:
+                        _, _, drop_path = topk_records.pop()
+                        try:
+                            if drop_path.exists() and drop_path != best_path:
+                                drop_path.unlink()
+                        except OSError:
+                            pass
+                    save_json(
+                        Path(paths["logs_dir"]) / "topk_checkpoints.json",
+                        {
+                            "save_metric": save_metric,
+                            "items": [
+                                {"epoch": e, "metric": m, "path": str(p)}
+                                for m, e, p in topk_records
+                            ],
+                        },
+                    )
+
+            if bad_epochs >= early_stop_patience:
+                break
 
         if is_distributed():
             torch.distributed.barrier()

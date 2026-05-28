@@ -1,0 +1,107 @@
+# 96GB 显存服务器专用 K-Fold 配置（基于跑出 0.7285 的 lmf_8g 结构）
+# 针对 RTX 6000 96G 进行了批处理和并行度优化
+
+seed: 42
+chunk_ms: 80
+context_chunks: 375
+target_chunks: 25
+stride: 5
+sample_rate: 16000
+max_train_samples: null
+max_valid_samples: null
+num_workers: 8  # 提高 CPU 加载并行度
+
+paths:
+  # 注意：在租用的服务器上，你需要修改这里的绝对路径，指向你挂载的数据集
+  project_root: /path/to/2026_finvcup_baseline
+  train_audio_dir: /path/to/2026_finvcup_baseline/train/audio
+  train_text_dir: /path/to/2026_finvcup_baseline/train/text
+  train_labels_dir: /path/to/2026_finvcup_baseline/train/labels
+
+  output_root: /path/to/2026_finvcup_baseline/outputs/lmf_96g_kfold
+  checkpoints_dir: /path/to/2026_finvcup_baseline/outputs/lmf_96g_kfold/checkpoints
+  logs_dir: /path/to/2026_finvcup_baseline/outputs/lmf_96g_kfold/logs
+
+  cache_root: /path/to/2026_finvcup_baseline/.cache
+
+labels:
+  C: 0
+  T: 1
+  BC: 2
+  I: 3
+  NA: 4
+  positive_ids: [1, 2, 3]
+  multi_targets: [C, NA, I, BC, T]
+
+split:
+  valid_ratio: 0.1
+  by_conversation: true
+
+# 保持 lmf_8g 成功的模型结构
+audio_encoder:
+  type: whisper
+  model_name: openai/whisper-large-v3
+  proj_dim: 512
+  freeze: true
+  unfreeze_layers: 1
+  # 可选：如果你在 96G 上想跑满音频上下文，可以关掉 tail_ratio
+  # tail_ratio: 0.2 
+  # encode_tail_audio: true
+
+text_encoder:
+  model_name: Qwen/Qwen3-0.6B
+  max_length: 256
+  freeze_backbone: true
+
+context_encoder:
+  vocab_size: 5
+  embed_dim: 16
+  channels: [32, 64]
+
+fusion:
+  hidden_dim: 256
+  bilinear_rank: 48
+  dropout: 0.2
+
+train:
+  multi_label: true
+  pos_weight_mode: capped_per_label
+  pos_weight_cap: 5.0
+  focal_gamma: 1.0
+
+  epochs: 80
+  max_steps_per_epoch: 20000
+  
+  # 96G 算力自由，直接评测整折验证集，阈值最准
+  eval_valid_sample_count: null 
+  eval_valid_max_batches: null
+  eval_valid_shuffle: false
+
+  # 🚀 96G 核心提速参数
+  batch_size: 16
+  eval_batch_size: 64
+  log_every_steps: 10
+  gradient_accumulation_steps: 1  # 真实 Batch Size = 16
+
+  learning_rate: 5.0e-5
+  warmup_ratio: 0.01
+  ema_decay: 0.98
+  weight_decay: 0.01
+  grad_clip_norm: 1.0
+  use_amp: true
+  
+  # 建议在 96G 机器上开启模型 EMA 稳定训练 (直接放 GPU 即可)
+  model_ema_decay: 0.999
+  model_ema_device: "gpu"
+
+  save_metric: best_f1  # 保持原有 metric 或者改 best_micro_f1
+  best_checkpoint_name: best_lmf.pt
+  save_topk: 1
+  early_stop_patience: 15
+
+env:
+  # 注意：在租用的服务器上也要对应修改环境变量路径
+  HF_HOME: /path/to/2026_finvcup_baseline/.cache/huggingface
+  TRANSFORMERS_CACHE: /path/to/2026_finvcup_baseline/.cache/huggingface
+  TORCH_HOME: /path/to/2026_finvcup_baseline/.cache/torch
+  HF_ENDPOINT: https://hf-mirror.com

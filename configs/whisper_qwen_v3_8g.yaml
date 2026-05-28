@@ -1,0 +1,125 @@
+# v3: 在 lmf_8g 基础上叠 Tier 1 提分组合
+# 关键变化：
+#   - audio/text encoder 各解冻最后 2 层；backbone 用 5e-6 小 lr
+#   - 损失改为 Asymmetric Loss (ASL)，gamma_neg=4, clip=0.05；保留 capped_per_label pos_weight
+#   - WeightedRandomSampler (alpha=0.5, max_weight=8) 提升 BC/I 命中率
+#   - EMA model (decay=0.999) 稳定后期波动
+#   - save_metric = best_micro_f1（与线上 metric 口径一致），top-3 ckpt 全保留
+#   - eval_valid_sample_count 提到 20000，让阈值与选 ckpt 都更稳
+#   - early_stop_patience 20，配合 EMA + sampler 让训练有时间继续进步
+
+seed: 42
+chunk_ms: 80
+context_chunks: 375
+target_chunks: 25
+stride: 5
+sample_rate: 16000
+max_train_samples: null
+max_valid_samples: null
+num_workers: 2
+
+paths:
+  project_root: D:/bisai/2026_finvcup_baseline
+  train_audio_dir: D:/bisai/2026_finvcup_baseline/train/audio
+  train_text_dir: D:/bisai/2026_finvcup_baseline/train/text
+  train_labels_dir: D:/bisai/2026_finvcup_baseline/train/labels
+
+  output_root: D:/bisai/2026_finvcup_baseline/outputs/v3_8g
+  checkpoints_dir: D:/bisai/2026_finvcup_baseline/outputs/v3_8g/checkpoints
+  logs_dir: D:/bisai/2026_finvcup_baseline/outputs/v3_8g/logs
+
+  cache_root: D:/bisai/2026_finvcup_baseline/.cache
+
+labels:
+  C: 0
+  T: 1
+  BC: 2
+  I: 3
+  NA: 4
+  positive_ids: [1, 2, 3]
+  multi_targets: [C, NA, I, BC, T]
+
+split:
+  valid_ratio: 0.1
+  by_conversation: true
+
+audio_encoder:
+  type: whisper
+  model_name: openai/whisper-large-v3
+  proj_dim: 512
+  freeze: true
+  unfreeze_layers: 2
+  tail_ratio: 0.2
+  encode_tail_audio: true
+
+text_encoder:
+  model_name: Qwen/Qwen3-0.6B
+  max_length: 256
+  freeze_backbone: true
+  unfreeze_layers: 2
+  tail_ratio: 0.3
+
+context_encoder:
+  vocab_size: 5
+  embed_dim: 16
+  channels: [32, 64]
+
+fusion:
+  hidden_dim: 256
+  bilinear_rank: 48
+  dropout: 0.2
+  modality_dropout: 0.1
+
+train:
+  multi_label: true
+
+  # ---- 损失 ----
+  loss: asl
+  asl_gamma_pos: 0.0
+  asl_gamma_neg: 4.0
+  asl_clip: 0.05
+  pos_weight_mode: capped_per_label
+  pos_weight_cap: 12.0
+  # focal 参数保留作为回退
+  focal_gamma: 0.0
+
+  # ---- 优化 ----
+  epochs: 60
+  max_steps_per_epoch: 20000
+  # 训练期 eval 只用 4000 样本（与 lmf_8g 一致），约 35min/eval。最终阈值校准
+  # 由 tune_threshold_full 在训练结束后用更大子集（20000）跑，二者分工。
+  eval_valid_sample_count: 4000
+  eval_valid_max_batches: null
+  eval_valid_shuffle: false
+
+  batch_size: 1
+  eval_batch_size: 2
+  log_every_steps: 40
+
+  learning_rate: 5.0e-5
+  backbone_learning_rate: 5.0e-6
+  warmup_ratio: 0.02
+  ema_decay: 0.98          # 用于 loss 平滑日志
+  model_ema_decay: 0.999   # 用于权重 EMA（关键）
+  weight_decay: 0.01
+  grad_clip_norm: 1.0
+  use_amp: true
+  gradient_accumulation_steps: 8
+
+  # ---- 选 ckpt + 早停 ----
+  save_metric: best_micro_f1
+  best_checkpoint_name: best_v3.pt
+  save_topk: 3
+  early_stop_patience: 20
+
+  # ---- 采样 ----
+  sampler:
+    type: weighted
+    alpha: 0.5
+    max_weight: 8.0
+
+env:
+  HF_HOME: D:/bisai/2026_finvcup_baseline/.cache/huggingface
+  TRANSFORMERS_CACHE: D:/bisai/2026_finvcup_baseline/.cache/huggingface
+  TORCH_HOME: D:/bisai/2026_finvcup_baseline/.cache/torch
+  HF_ENDPOINT: https://hf-mirror.com

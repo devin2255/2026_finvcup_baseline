@@ -22,7 +22,7 @@ from transformers import AutoTokenizer
 
 from src.data import TurnTakingTestDataset, build_collate_fn
 from src.models import MultimodalTurnTakingModel
-from src.utils import load_config, set_env_paths
+from src.utils import apply_label_constraints, load_config, set_env_paths
 
 
 def parse_args():
@@ -34,6 +34,11 @@ def parse_args():
     p.add_argument("--threshold_file", type=str, default=None, help="per-label thresholds JSON (overrides --threshold)")
     p.add_argument("--batch_size", type=int, default=None, help="默认取 config train.eval_batch_size")
     p.add_argument("--max_segments", type=int, default=None, help="仅处理前 N 条（冒烟测试）")
+    p.add_argument(
+        "--no_constraints",
+        action="store_true",
+        help="禁用标签互斥后处理（NA 压制动作类、C/T 互斥）",
+    )
     p.add_argument(
         "--output_csv",
         type=str,
@@ -88,6 +93,9 @@ def main():
     model.load_state_dict(ckpt["model"], strict=False)
     model.eval()
     use_amp = bool(cfg["train"].get("use_amp", False))
+    apply_constraints = bool(cfg.get("infer", {}).get("apply_label_constraints", True))
+    if args.no_constraints:
+        apply_constraints = False
 
     out_path = Path(args.output_csv)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -124,6 +132,8 @@ def main():
                 for j, name in enumerate(label_cols):
                     thr = float(per_label_thresholds[name]) if per_label_thresholds else args.threshold
                     preds_binary.append(int(float(p[j]) >= thr))
+                if apply_constraints:
+                    preds_binary = apply_label_constraints(preds_binary, p, label_cols)
                 row = {"segment_id": seg_id}
                 for j, col in enumerate(label_cols):
                     row[col] = preds_binary[j]
