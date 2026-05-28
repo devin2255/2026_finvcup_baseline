@@ -43,13 +43,13 @@ audio_encoder:
   model_name: openai/whisper-large-v3
   proj_dim: 512
   freeze: true
-  unfreeze_layers: 4
+  unfreeze_layers: 2
 
 text_encoder:
   model_name: Qwen/Qwen3-0.6B
   max_length: 256
   freeze_backbone: true
-  unfreeze_layers: 4
+  unfreeze_layers: 2
 
 context_encoder:
   vocab_size: 5
@@ -67,8 +67,8 @@ train:
   pos_weight_cap: 5.0
   focal_gamma: 1.0
 
-  epochs: 80
-  max_steps_per_epoch: 20000
+  epochs: 15
+  max_steps_per_epoch: 2000
   
   # 96G 算力自由，直接评测整折验证集，阈值最准
   eval_valid_sample_count: null 
@@ -92,10 +92,10 @@ train:
   model_ema_decay: 0.999
   model_ema_device: "gpu"
 
-  save_metric: best_f1  # 保持原有 metric 或者改 best_micro_f1
+  save_metric: best_micro_f1  # 保持原有 metric 或者改 best_micro_f1
   best_checkpoint_name: best_lmf.pt
   save_topk: 1
-  early_stop_patience: 15
+  early_stop_patience: 6
 
 env:
   # 注意：在租用的服务器上也要对应修改环境变量路径
