@@ -43,15 +43,13 @@ audio_encoder:
   model_name: openai/whisper-large-v3
   proj_dim: 512
   freeze: true
-  unfreeze_layers: 1
-  # 可选：如果你在 96G 上想跑满音频上下文，可以关掉 tail_ratio
-  # tail_ratio: 0.2 
-  # encode_tail_audio: true
+  unfreeze_layers: 4
 
 text_encoder:
   model_name: Qwen/Qwen3-0.6B
   max_length: 256
   freeze_backbone: true
+  unfreeze_layers: 4
 
 context_encoder:
   vocab_size: 5
@@ -78,10 +76,10 @@ train:
   eval_valid_shuffle: false
 
   # 🚀 96G 核心提速参数
-  batch_size: 16
-  eval_batch_size: 64
+  batch_size: 64
+  eval_batch_size: 128
   log_every_steps: 10
-  gradient_accumulation_steps: 1  # 真实 Batch Size = 16
+  gradient_accumulation_steps: 1  # 真实 Batch Size = 64
 
   learning_rate: 5.0e-5
   warmup_ratio: 0.01
