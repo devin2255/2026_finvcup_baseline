@@ -1,0 +1,102 @@
+# 96GB 显存服务器专用 - 单模型极速提分版
+# 放弃 5 折交叉验证（太烧钱），改用 95% 数据训练单模型，利用 96G 显存开超级大 Batch
+
+seed: 42
+chunk_ms: 80
+context_chunks: 375
+target_chunks: 25
+stride: 5
+sample_rate: 16000
+max_train_samples: null
+max_valid_samples: null
+num_workers: 8  # 提高 CPU 加载并行度
+
+paths:
+  # 注意：在租用的服务器上，修改这里的绝对路径
+  project_root: /root/autodl-tmp/2026_finvcup_baseline
+  train_audio_dir: /root/autodl-tmp/2026_finvcup_baseline/train/audio
+  train_text_dir: /root/autodl-tmp/2026_finvcup_baseline/train/text
+  train_labels_dir: /root/autodl-tmp/2026_finvcup_baseline/train/labels
+
+  output_root: /root/autodl-tmp/2026_finvcup_baseline/outputs/lmf_96g_fast
+  checkpoints_dir: /root/autodl-tmp/2026_finvcup_baseline/outputs/lmf_96g_fast/checkpoints
+  logs_dir: /root/autodl-tmp/2026_finvcup_baseline/outputs/lmf_96g_fast/logs
+  cache_root: /root/autodl-tmp/2026_finvcup_baseline/.cache
+
+labels:
+  C: 0
+  T: 1
+  BC: 2
+  I: 3
+  NA: 4
+  positive_ids: [1, 2, 3]
+  multi_targets: [C, NA, I, BC, T]
+
+split:
+  valid_ratio: 0.05  # 用 95% 的数据训练，模型见过的样本更多！
+  by_conversation: true
+
+audio_encoder:
+  type: whisper
+  model_name: openai/whisper-large-v3
+  proj_dim: 512
+  freeze: true
+  unfreeze_layers: 2  # 解冻 2 层增加模型表达能力
+
+text_encoder:
+  model_name: Qwen/Qwen3-0.6B
+  max_length: 256
+  freeze_backbone: true
+  unfreeze_layers: 2  # 同样解冻文本端 2 层
+
+context_encoder:
+  vocab_size: 5
+  embed_dim: 16
+  channels: [32, 64]
+
+fusion:
+  hidden_dim: 256
+  bilinear_rank: 48
+  dropout: 0.2
+
+train:
+  multi_label: true
+  pos_weight_mode: capped_per_label
+  pos_weight_cap: 5.0
+  focal_gamma: 1.0
+
+  epochs: 10           # 只需要跑 10 轮
+  max_steps_per_epoch: null  # 跑满整个 epoch 
+  
+  # 评测提速：每轮只随机抽取 8000 条验证（约一两分钟评测完），节省算力费
+  eval_valid_sample_count: 8000 
+  eval_valid_max_batches: null
+  eval_valid_shuffle: true
+
+  # 🚀 96G 核心提速参数：超级 Batch Size
+  # 这样一步相当于以前的几十步，1 个 epoch 只需要约 5000 步
+  batch_size: 256
+  eval_batch_size: 512
+  log_every_steps: 10
+  gradient_accumulation_steps: 1
+
+  learning_rate: 1.0e-4  # Batch size 变大，学习率适当调大
+  warmup_ratio: 0.05
+  ema_decay: 0.98
+  weight_decay: 0.01
+  grad_clip_norm: 1.0
+  use_amp: true
+  
+  model_ema_decay: 0.999
+  model_ema_device: "gpu"
+
+  save_metric: best_f1
+  best_checkpoint_name: best_lmf_fast.pt
+  save_topk: 1
+  early_stop_patience: 5
+
+env:
+  HF_HOME: /root/autodl-tmp/2026_finvcup_baseline/.cache/huggingface
+  TRANSFORMERS_CACHE: /root/autodl-tmp/2026_finvcup_baseline/.cache/huggingface
+  TORCH_HOME: /root/autodl-tmp/2026_finvcup_baseline/.cache/torch
+  HF_ENDPOINT: https://hf-mirror.com
