@@ -41,13 +41,13 @@ audio_encoder:
   model_name: openai/whisper-large-v3
   proj_dim: 512
   freeze: true
-  unfreeze_layers: 2  # 解冻 2 层增加模型表达能力
+  unfreeze_layers: 1  # 恢复到单层解冻，大幅降低后向传播的耗时
 
 text_encoder:
   model_name: Qwen/Qwen3-0.6B
   max_length: 256
   freeze_backbone: true
-  unfreeze_layers: 2  # 同样解冻文本端 2 层
+  # 移除 unfreeze_layers: 2，完全冻结文本端，极大提升训练速度
 
 context_encoder:
   vocab_size: 5
@@ -65,8 +65,8 @@ train:
   pos_weight_cap: 5.0
   focal_gamma: 1.0
 
-  epochs: 10           # 只需要跑 10 轮
-  max_steps_per_epoch: null  # 跑满整个 epoch 
+  epochs: 15
+  max_steps_per_epoch: 1000  # 每轮只跑 1000 步（约 25 万样本）
   
   # 评测提速：每轮只随机抽取 8000 条验证（约一两分钟评测完），节省算力费
   eval_valid_sample_count: 8000 
