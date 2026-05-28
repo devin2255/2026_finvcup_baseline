@@ -76,10 +76,10 @@ train:
   eval_valid_shuffle: false
 
   # 🚀 96G 核心提速参数
-  batch_size: 128
-  eval_batch_size: 192
+  batch_size: 192
+  eval_batch_size: 256
   log_every_steps: 10
-  gradient_accumulation_steps: 1  # 真实 Batch Size = 128
+  gradient_accumulation_steps: 1  # 真实 Batch Size = 192
 
   learning_rate: 5.0e-5
   warmup_ratio: 0.01
