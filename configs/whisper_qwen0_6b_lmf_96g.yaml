@@ -1,0 +1,89 @@
+seed: 42
+chunk_ms: 80
+context_chunks: 500
+target_chunks: 25
+stride: 5
+sample_rate: 16000
+max_train_samples: null
+max_valid_samples: null
+num_workers: 8
+
+paths:
+  project_root: /root/autodl-tmp/V2/2026_finvcup_baseline
+  train_audio_dir: /root/autodl-tmp/V2/2026_finvcup_baseline/train/audio
+  train_text_dir: /root/autodl-tmp/V2/2026_finvcup_baseline/train/text
+  train_labels_dir: /root/autodl-tmp/V2/2026_finvcup_baseline/train/labels
+
+  output_root: /root/autodl-tmp/V2/2026_finvcup_baseline/outputs/lmf_96g
+  checkpoints_dir: /root/autodl-tmp/V2/2026_finvcup_baseline/outputs/lmf_96g/checkpoints
+  logs_dir: /root/autodl-tmp/V2/2026_finvcup_baseline/outputs/lmf_96g/logs
+
+  cache_root: /root/autodl-tmp/V2/2026_finvcup_baseline/.cache
+
+labels:
+  C: 0
+  T: 1
+  BC: 2
+  I: 3
+  NA: 4
+  positive_ids: [1, 2, 3]
+  multi_targets: [C, NA, I, BC, T]
+
+split:
+  valid_ratio: 0.1
+  by_conversation: true
+
+audio_encoder:
+  type: whisper
+  model_name: openai/whisper-large-v3
+  proj_dim: 512
+  freeze: true
+  unfreeze_layers: 4
+
+text_encoder:
+  model_name: Qwen/Qwen3-0.6B
+  max_length: 256
+  freeze_backbone: true
+
+context_encoder:
+  vocab_size: 5
+  embed_dim: 16
+  channels: [32, 64]
+
+fusion:
+  hidden_dim: 512
+  bilinear_rank: 96
+  dropout: 0.2
+
+train:
+  multi_label: true
+  pos_weight_mode: capped_per_label
+  pos_weight_cap: 5.0
+  focal_gamma: 1.0
+
+  epochs: 80
+  max_steps_per_epoch: 20000
+  eval_valid_sample_count: 4000
+  eval_valid_max_batches: null
+  eval_valid_shuffle: false
+
+  batch_size: 8
+  eval_batch_size: 16
+  log_every_steps: 40
+
+  learning_rate: 5.0e-5
+  warmup_ratio: 0.01
+  ema_decay: 0.98
+  weight_decay: 0.01
+  grad_clip_norm: 1.0
+  use_amp: true
+  gradient_accumulation_steps: 2
+  save_metric: best_f1
+  best_checkpoint_name: best_lmf.pt
+  early_stop_patience: 15
+
+env:
+  HF_HOME: /root/autodl-tmp/V2/2026_finvcup_baseline/.cache/huggingface
+  TRANSFORMERS_CACHE: /root/autodl-tmp/V2/2026_finvcup_baseline/.cache/huggingface
+  TORCH_HOME: /root/autodl-tmp/V2/2026_finvcup_baseline/.cache/torch
+  HF_ENDPOINT: https://hf-mirror.com
