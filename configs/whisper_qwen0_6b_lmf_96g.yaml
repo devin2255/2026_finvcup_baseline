@@ -62,22 +62,22 @@ train:
   focal_gamma: 1.0
 
   epochs: 80
-  max_steps_per_epoch: 20000
-  eval_valid_sample_count: 4000
+  max_steps_per_epoch: 2000  # 20000
+  eval_valid_sample_count: null
   eval_valid_max_batches: null
   eval_valid_shuffle: false
 
-  batch_size: 8
-  eval_batch_size: 16
+  batch_size: 192
+  eval_batch_size: 384
   log_every_steps: 40
 
-  learning_rate: 5.0e-5
+  learning_rate: 6.0e-4
   warmup_ratio: 0.01
   ema_decay: 0.98
   weight_decay: 0.01
   grad_clip_norm: 1.0
   use_amp: true
-  gradient_accumulation_steps: 2
+  gradient_accumulation_steps: 1
   save_metric: best_f1
   best_checkpoint_name: best_lmf.pt
   early_stop_patience: 15
